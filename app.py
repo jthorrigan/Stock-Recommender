@@ -1,7 +1,7 @@
 """
 Stock Recommendation Web App - Streamlit Application
 Daily web crawler and AI-powered stock recommendations
-Uses yfinance for best free stock data access
+Uses yfinance with historical data fallback
 """
 
 import streamlit as st
@@ -114,6 +114,7 @@ def clear_cache():
 def get_company_info(ticker: str) -> Dict:
     """
     Fetch company information using yfinance
+    Uses historical data as fallback if info fails
     
     Args:
         ticker: Stock ticker symbol
@@ -179,35 +180,23 @@ def _get_company_info_fallback(ticker: str) -> Dict:
 def is_metrics_complete(metrics: Dict) -> bool:
     """
     Check if metrics have sufficient data
-    Accept data if we have price + any other metric
+    Accept data if we have price
     
     Args:
         metrics: Dictionary with metrics
     
     Returns:
-        True if metrics have price + at least 1 other value
+        True if metrics have price
     """
     if metrics['price'] == 'N/A':
         return False
-    
-    # Count how many data points we have (excluding N/A and None)
-    data_count = 0
-    check_fields = ['price', '52_week_high', '52_week_low', 'market_cap', 'pe_ratio', 'dividend_yield']
-    
-    for field in check_fields:
-        if metrics.get(field) != 'N/A' and metrics.get(field) is not None and metrics.get(field) != '':
-            data_count += 1
-    
-    # Consider complete if we have at least price + 1 other metric
-    return data_count >= 2
+    return True
 
 @st.cache_data(ttl=3600)
 def get_enhanced_metrics(ticker: str) -> Dict:
     """
-    Fetch stock metrics - PRIORITY ORDER:
-    1. yfinance (FREE - BEST for market cap + all basic data)
-    2. Finnhub (FREE - 60/min, has P/E)
-    3. Alpha Vantage (LIMITED - 5/min)
+    Fetch stock metrics using yfinance historical data
+    This approach is more reliable than .info dictionary
     
     Args:
         ticker: Stock ticker symbol
@@ -235,92 +224,64 @@ def get_enhanced_metrics(ticker: str) -> Dict:
     try:
         logger.info(f"Fetching metrics for {ticker}")
         
-        # PRIMARY: yfinance (FREE - best for comprehensive data including market cap)
+        # PRIMARY: yfinance with historical data (more reliable)
         if YFINANCE_AVAILABLE:
             try:
-                logger.info(f"[1/3] Trying yfinance for {ticker}")
+                logger.info(f"[1/3] Trying yfinance historical data for {ticker}")
                 
                 ticker_obj = yf.Ticker(ticker)
-                info = ticker_obj.info
                 
-                if info and len(info) > 0:
-                    logger.info(f"yfinance returned {len(info)} fields for {ticker}")
-                    
-                    # Price - try multiple field names
-                    if 'currentPrice' in info:
-                        metrics['price'] = round(float(info.get('currentPrice')), 2)
-                        logger.info(f"{ticker} price (currentPrice): ${metrics['price']}")
-                    elif 'regularMarketPrice' in info:
-                        metrics['price'] = round(float(info.get('regularMarketPrice')), 2)
-                        logger.info(f"{ticker} price (regularMarketPrice): ${metrics['price']}")
-                    
-                    # P/E Ratio
-                    if 'trailingPE' in info:
-                        try:
-                            pe = info.get('trailingPE')
-                            if pe and pe > 0:
-                                metrics['pe_ratio'] = round(float(pe), 2)
-                                logger.info(f"{ticker} P/E: {metrics['pe_ratio']}")
-                        except Exception as pe_err:
-                            logger.debug(f"P/E extraction failed: {pe_err}")
+                # Get historical data for last 1 year
+                hist = ticker_obj.history(period="1y")
+                
+                if not hist.empty:
+                    # Current price from most recent data
+                    latest_close = hist['Close'].iloc[-1]
+                    metrics['price'] = round(float(latest_close), 2)
+                    logger.info(f"{ticker} price from historical: ${metrics['price']}")
                     
                     # 52-week high/low
-                    if 'fiftyTwoWeekHigh' in info:
-                        try:
-                            metrics['52_week_high'] = round(float(info.get('fiftyTwoWeekHigh')), 2)
-                        except:
-                            pass
+                    metrics['52_week_high'] = round(float(hist['High'].max()), 2)
+                    metrics['52_week_low'] = round(float(hist['Low'].min()), 2)
+                    logger.info(f"{ticker} 52W: ${metrics['52_week_low']} - ${metrics['52_week_high']}")
                     
-                    if 'fiftyTwoWeekLow' in info:
-                        try:
-                            metrics['52_week_low'] = round(float(info.get('fiftyTwoWeekLow')), 2)
-                        except:
-                            pass
-                    
-                    # Market cap - THIS IS WHERE yfinance SHINES
-                    if 'marketCap' in info:
-                        try:
-                            market_cap = info.get('marketCap')
-                            if market_cap and market_cap > 0:
+                    # Also try .info for additional data
+                    try:
+                        info = ticker_obj.info
+                        if info:
+                            # Market cap
+                            if 'marketCap' in info and info['marketCap']:
+                                market_cap = info['marketCap']
                                 if market_cap >= 1e9:
                                     metrics['market_cap'] = f"${market_cap/1e9:.1f}B"
                                 elif market_cap >= 1e6:
                                     metrics['market_cap'] = f"${market_cap/1e6:.1f}M"
-                        except Exception as mc_err:
-                            logger.debug(f"Market cap extraction failed: {mc_err}")
+                            
+                            # P/E Ratio
+                            if 'trailingPE' in info and info['trailingPE']:
+                                metrics['pe_ratio'] = round(float(info['trailingPE']), 2)
+                            
+                            # Dividend yield
+                            if 'trailingAnnualDividendYield' in info and info['trailingAnnualDividendYield']:
+                                metrics['dividend_yield'] = round(float(info['trailingAnnualDividendYield']) * 100, 2)
+                            
+                            # EPS
+                            if 'trailingEps' in info and info['trailingEps']:
+                                metrics['eps'] = round(float(info['trailingEps']), 2)
+                    except Exception as info_err:
+                        logger.debug(f"Could not get additional info for {ticker}: {info_err}")
                     
-                    # Dividend yield
-                    if 'trailingAnnualDividendYield' in info:
-                        try:
-                            div = info.get('trailingAnnualDividendYield')
-                            if div and div > 0:
-                                metrics['dividend_yield'] = round(float(div) * 100, 2)
-                        except:
-                            pass
-                    
-                    # EPS
-                    if 'trailingEps' in info:
-                        try:
-                            eps = info.get('trailingEps')
-                            if eps:
-                                metrics['eps'] = round(float(eps), 2)
-                        except:
-                            pass
-                    
-                    if is_metrics_complete(metrics):
-                        metrics['data_source'] = 'yfinance'
-                        logger.info(f"✅ yfinance complete for {ticker}")
-                        return metrics
-                    else:
-                        logger.info(f"⚠️ yfinance has price, trying Finnhub for more data")
+                    metrics['data_source'] = 'yfinance (Historical)'
+                    logger.info(f"✅ yfinance historical complete for {ticker}")
+                    return metrics
                 else:
-                    logger.warning(f"yfinance returned empty or no info for {ticker}")
+                    logger.warning(f"No historical data for {ticker}")
             
             except Exception as yf_err:
-                logger.error(f"yfinance error: {str(yf_err)}", exc_info=True)
+                logger.error(f"yfinance historical error: {str(yf_err)}", exc_info=True)
         
         # SECONDARY: Finnhub (FREE - 60 calls/min)
-        if FINNHUB_API_KEY and metrics['price'] != 'N/A':
+        if FINNHUB_API_KEY:
             try:
                 logger.info(f"[2/3] Trying Finnhub for {ticker}")
                 
@@ -330,32 +291,21 @@ def get_enhanced_metrics(ticker: str) -> Dict:
                 if quote_response.status_code == 200:
                     quote_data = quote_response.json()
                     
-                    # Only fill in missing data
-                    if metrics['pe_ratio'] == 'N/A' and quote_data.get('pe'):
-                        try:
-                            metrics['pe_ratio'] = round(float(quote_data.get('pe')), 2)
-                            logger.info(f"{ticker} P/E from Finnhub: {metrics['pe_ratio']}")
-                        except:
-                            pass
-                    
-                    if metrics['52_week_high'] == 'N/A' and quote_data.get('h52'):
+                    if quote_data.get('c'):
+                        metrics['price'] = round(float(quote_data.get('c')), 2)
+                    if quote_data.get('h52'):
                         metrics['52_week_high'] = round(float(quote_data.get('h52')), 2)
-                    
-                    if metrics['52_week_low'] == 'N/A' and quote_data.get('l52'):
+                    if quote_data.get('l52'):
                         metrics['52_week_low'] = round(float(quote_data.get('l52')), 2)
+                    if quote_data.get('pe'):
+                        metrics['pe_ratio'] = round(float(quote_data.get('pe')), 2)
                     
-                    metrics['data_source'] = 'yfinance + Finnhub'
-                    logger.info(f"Finnhub supplemented data for {ticker}")
+                    metrics['data_source'] = 'Finnhub'
+                    logger.info(f"✅ Finnhub complete for {ticker}")
                     return metrics
             
             except Exception as fh_err:
                 logger.debug(f"Finnhub failed: {fh_err}")
-        
-        # If we already have price from yfinance, return it
-        if metrics['price'] != 'N/A':
-            metrics['data_source'] = 'yfinance'
-            logger.info(f"✅ Returning yfinance data for {ticker}")
-            return metrics
         
         # TERTIARY: Alpha Vantage (LIMITED - 5 calls/min)
         if ALPHA_VANTAGE_API_KEY != "demo":
@@ -380,7 +330,7 @@ def get_enhanced_metrics(ticker: str) -> Dict:
                     if quote.get('52WeekLow'):
                         metrics['52_week_low'] = round(float(quote.get('52WeekLow')), 2)
                     
-                    if is_metrics_complete(metrics):
+                    if metrics['price'] != 'N/A':
                         metrics['data_source'] = 'Alpha Vantage'
                         logger.info(f"✅ Alpha Vantage complete for {ticker}")
                         return metrics
@@ -1014,7 +964,7 @@ def render_analytics_dashboard(articles: List[Dict], recommendations: List[Dict]
     st.markdown("---")
     
     st.markdown("### 💹 Company Financial Metrics")
-    st.markdown("*Data from yfinance (no API key required)*")
+    st.markdown("*Data from yfinance historical data (more reliable)*")
     
     if articles:
         mentions = extract_stock_mentions(articles)
@@ -1069,7 +1019,7 @@ def main():
     init_session()
     
     st.title("📈 Stock Recommendation Engine")
-    st.markdown("AI-powered daily stock recommendations | Powered by yfinance (no API keys needed!)")
+    st.markdown("AI-powered daily stock recommendations | Powered by yfinance historical data")
     
     if not YFINANCE_AVAILABLE:
         st.error("❌ yfinance not installed! Run: `pip install yfinance`")
@@ -1104,17 +1054,6 @@ def main():
                 test_metrics = get_enhanced_metrics(test_ticker)
                 st.write("**Metrics Retrieved:**")
                 st.json(test_metrics)
-                
-                # Also show debug info
-                with st.expander("🔍 Debug Info"):
-                    if YFINANCE_AVAILABLE:
-                        ticker_obj = yf.Ticker(test_ticker)
-                        info = ticker_obj.info
-                        st.write(f"Total fields returned by yfinance: {len(info)}")
-                        st.write("Available fields:")
-                        st.json({k: v for k, v in list(info.items())[:20]})
-                    else:
-                        st.error("yfinance not available")
             except Exception as e:
                 st.error(f"Error: {str(e)}")
                 logger.error(f"Test ticker error: {str(e)}", exc_info=True)
@@ -1130,7 +1069,7 @@ def main():
         with st.expander("ℹ️ About"):
             st.markdown("""
             Stock Recommendation Engine using:
-            - yfinance for all stock data (no API key!)
+            - yfinance historical data (more reliable)
             - News crawling from 7 financial sources
             - AI-generated investment theses
             """)
