@@ -14,6 +14,12 @@ from functools import lru_cache
 import logging
 import xml.etree.ElementTree as ET
 import re
+import numpy as np
+
+try:
+    import yfinance as yf
+except ImportError:
+    yf = None
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -43,6 +49,8 @@ NEWS_SOURCES = {
 SEC_FILINGS_API = "https://www.sec.gov/cgi-bin/browse-edgar"
 ALPHA_VANTAGE_API_KEY = os.getenv("ALPHA_VANTAGE_API_KEY", "demo")
 HF_API_KEY = os.getenv("HF_API_KEY", "")
+FINNHUB_API_KEY = os.getenv("FINNHUB_API_KEY", "")
+FRED_API_KEY = os.getenv("FRED_API_KEY", "")
 
 # Expanded ticker list - Large-cap, Mid-cap, Small-cap, and ETFs
 STOCK_TICKERS = {
@@ -154,9 +162,11 @@ def get_company_info(ticker: str) -> Dict:
         }
 
 @st.cache_data(ttl=3600)
-def get_stock_metrics(ticker: str) -> Dict:
+def get_enhanced_metrics(ticker: str) -> Dict:
     """
-    Fetch stock metrics including volatility and technical indicators
+    Fetch comprehensive stock metrics from multiple free sources
+    Primary: yfinance (no auth needed)
+    Secondary: Finnhub (if API key available)
     
     Args:
         ticker: Stock ticker symbol
@@ -164,90 +174,143 @@ def get_stock_metrics(ticker: str) -> Dict:
     Returns:
         Dictionary with stock metrics
     """
+    
+    metrics = {
+        'ticker': ticker,
+        'pe_ratio': 'N/A',
+        'cape_ratio': 'N/A',
+        'volatility': 'N/A',
+        'price': 'N/A',
+        '52_week_high': 'N/A',
+        '52_week_low': 'N/A',
+        'market_cap': 'N/A',
+        'dividend_yield': 'N/A',
+        'eps': 'N/A',
+        'revenue': 'N/A',
+        'profit_margin': 'N/A',
+        'data_source': 'None'
+    }
+    
     try:
-        metrics = {
-            'ticker': ticker,
-            'pe_ratio': 'N/A',
-            'cape_ratio': 'N/A',
-            'volatility': 'N/A',
-            'beta': 'N/A',
-            '52_week_high': 'N/A',
-            '52_week_low': 'N/A',
-            'avg_volume': 'N/A'
-        }
-        
-        if ALPHA_VANTAGE_API_KEY == "demo":
-            return metrics
-        
-        # Fetch daily data for volatility calculation
-        params = {
-            'function': 'TIME_SERIES_DAILY',
-            'symbol': ticker,
-            'outputsize': 'compact',
-            'apikey': ALPHA_VANTAGE_API_KEY
-        }
-        
-        response = requests.get('https://www.alphavantage.co/query', params=params, timeout=10)
-        response.raise_for_status()
-        data = response.json()
-        
-        if 'Time Series (Daily)' in data:
-            time_series = data['Time Series (Daily)']
+        # Primary source: yfinance (completely free, no API key needed)
+        if yf is not None:
+            yf_ticker = yf.Ticker(ticker)
+            yf_info = yf_ticker.info
             
-            # Get last 90 days of data for volatility
-            prices = []
-            for date, daily_data in sorted(time_series.items())[-90:]:
-                try:
-                    close = float(daily_data['4. close'])
-                    prices.append(close)
-                except:
-                    pass
+            # Get price history for volatility calculation (90 days)
+            try:
+                hist = yf_ticker.history(period="90d", progress=False)
+                
+                if not hist.empty and len(hist) > 1:
+                    # Calculate volatility from 90-day returns
+                    returns = hist['Close'].pct_change().dropna()
+                    if len(returns) > 0:
+                        volatility = returns.std() * np.sqrt(252)  # Annualized
+                        metrics['volatility'] = round(volatility * 100, 2)
+            except Exception as e:
+                logger.debug(f"Error calculating volatility for {ticker}: {str(e)}")
             
-            if len(prices) > 1:
-                # Calculate volatility (standard deviation of returns)
-                returns = [(prices[i] - prices[i-1]) / prices[i-1] for i in range(1, len(prices))]
-                volatility = (sum((r - sum(returns) / len(returns)) ** 2 for r in returns) / len(returns)) ** 0.5
-                metrics['volatility'] = round(volatility * 100, 2)  # Convert to percentage
+            # Extract metrics from yfinance
+            if yf_info.get('trailingPE') and yf_info.get('trailingPE') != 'N/A':
+                metrics['pe_ratio'] = round(float(yf_info.get('trailingPE', 'N/A')), 2)
+            
+            if yf_info.get('currentPrice'):
+                metrics['price'] = round(float(yf_info.get('currentPrice')), 2)
+            
+            if yf_info.get('fiftyTwoWeekHigh'):
+                metrics['52_week_high'] = round(float(yf_info.get('fiftyTwoWeekHigh')), 2)
+            
+            if yf_info.get('fiftyTwoWeekLow'):
+                metrics['52_week_low'] = round(float(yf_info.get('fiftyTwoWeekLow')), 2)
+            
+            if yf_info.get('marketCap'):
+                market_cap = yf_info.get('marketCap')
+                if market_cap >= 1e9:
+                    metrics['market_cap'] = f"${market_cap/1e9:.1f}B"
+                elif market_cap >= 1e6:
+                    metrics['market_cap'] = f"${market_cap/1e6:.1f}M"
+            
+            if yf_info.get('dividendYield'):
+                metrics['dividend_yield'] = round(float(yf_info.get('dividendYield')) * 100, 2)
+            
+            if yf_info.get('trailingEps'):
+                metrics['eps'] = round(float(yf_info.get('trailingEps')), 2)
+            
+            if yf_info.get('profitMargins'):
+                metrics['profit_margin'] = round(float(yf_info.get('profitMargins')) * 100, 2)
+            
+            metrics['data_source'] = 'yfinance'
+        
+        # Secondary source: Finnhub (if API key available - backup/validation)
+        if FINNHUB_API_KEY:
+            try:
+                finnhub_url = f"https://finnhub.io/api/v1/quote?symbol={ticker}&token={FINNHUB_API_KEY}"
+                response = requests.get(finnhub_url, timeout=5)
                 
-                # 52-week high/low
-                metrics['52_week_high'] = round(max(prices), 2)
-                metrics['52_week_low'] = round(min(prices), 2)
-                
-                # Average volume (approximated)
-                metrics['avg_volume'] = len(prices)
-        
-        # Fetch overview data for PE ratio
-        overview_params = {
-            'function': 'OVERVIEW',
-            'symbol': ticker,
-            'apikey': ALPHA_VANTAGE_API_KEY
-        }
-        
-        overview_response = requests.get('https://www.alphavantage.co/query', params=overview_params, timeout=10)
-        overview_response.raise_for_status()
-        overview_data = overview_response.json()
-        
-        if 'PERatio' in overview_data and overview_data['PERatio'] != 'None':
-            metrics['pe_ratio'] = round(float(overview_data.get('PERatio', 0)), 2)
-        
-        # Note: CAPE ratio requires historical earnings data which is complex to calculate
-        # For now, we'll note it as N/A or calculate a simplified version
-        metrics['cape_ratio'] = 'Market Data Required'
-        
-        return metrics
+                if response.status_code == 200:
+                    finnhub_data = response.json()
+                    
+                    # Use Finnhub as fallback if yfinance data is missing
+                    if metrics['pe_ratio'] == 'N/A' and finnhub_data.get('pe'):
+                        metrics['pe_ratio'] = round(float(finnhub_data.get('pe')), 2)
+                    
+                    if metrics['52_week_high'] == 'N/A' and finnhub_data.get('h52'):
+                        metrics['52_week_high'] = round(float(finnhub_data.get('h52')), 2)
+                    
+                    if metrics['52_week_low'] == 'N/A' and finnhub_data.get('l52'):
+                        metrics['52_week_low'] = round(float(finnhub_data.get('l52')), 2)
+                    
+                    if metrics['price'] == 'N/A' and finnhub_data.get('c'):
+                        metrics['price'] = round(float(finnhub_data.get('c')), 2)
+                    
+                    if metrics['data_source'] == 'yfinance':
+                        metrics['data_source'] = 'yfinance + Finnhub'
+            
+            except Exception as e:
+                logger.debug(f"Error fetching Finnhub data for {ticker}: {str(e)}")
     
     except Exception as e:
-        logger.warning(f"Error fetching metrics for {ticker}: {str(e)}")
-        return {
-            'ticker': ticker,
-            'pe_ratio': 'N/A',
-            'cape_ratio': 'N/A',
-            'volatility': 'N/A',
-            'beta': 'N/A',
-            '52_week_high': 'N/A',
-            '52_week_low': 'N/A',
-            'avg_volume': 'N/A'
-        }
+        logger.warning(f"Error fetching enhanced metrics for {ticker}: {str(e)}")
+    
+    return metrics
+
+@st.cache_data(ttl=86400)
+def get_cape_ratio_approximation() -> Dict:
+    """
+    Fetch CAPE ratio from FRED API (Shiller P/E)
+    Returns the most recent CAPE ratio for reference
+    
+    Returns:
+        Dictionary with CAPE ratio data
+    """
+    
+    cape_data = {
+        'cape_ratio': 'N/A',
+        'cape_date': 'N/A',
+        'cape_source': 'FRED'
+    }
+    
+    if not FRED_API_KEY:
+        return cape_data
+    
+    try:
+        # Fetch Shiller P/E (CAPE) from FRED
+        url = f"https://api.stlouisfed.org/fred/series/MULTPL.SHILLER_PE_RATIO/observations?api_key={FRED_API_KEY}&sort_order=desc&limit=1"
+        response = requests.get(url, timeout=10)
+        
+        if response.status_code == 200:
+            data = response.json()
+            if 'observations' in data and len(data['observations']) > 0:
+                obs = data['observations'][0]
+                cape_value = obs.get('value')
+                if cape_value and cape_value != '.':
+                    cape_data['cape_ratio'] = round(float(cape_value), 2)
+                    cape_data['cape_date'] = obs.get('date', 'N/A')
+    
+    except Exception as e:
+        logger.debug(f"Error fetching CAPE ratio from FRED: {str(e)}")
+    
+    return cape_data
 
 # ============================================================================
 # WEB CRAWLING FUNCTIONS
@@ -920,28 +983,36 @@ def render_analytics_dashboard(articles: List[Dict], recommendations: List[Dict]
     
     # Company Metrics Section
     st.markdown("### 💹 Company Financial Metrics")
-    st.markdown("*Most recent P/E ratio, CAPE ratio approximation, and volatility data*")
+    st.markdown("*Most recent P/E ratio, CAPE ratio, volatility, and other key financial data*")
     
     if articles:
         mentions = extract_stock_mentions(articles)
         
         # Fetch metrics for mentioned tickers
         metrics_data = []
-        with st.spinner("Fetching financial metrics..."):
-            for ticker in sorted(mentions.keys()):
-                metrics = get_stock_metrics(ticker)
-                company_info = get_company_info(ticker)
-                
-                metrics_data.append({
-                    'Ticker': ticker,
-                    'Company': company_info.get('name', ticker)[:20],  # Truncate long names
-                    'Category': TICKER_CATEGORIES.get(ticker, 'N/A'),
-                    'P/E Ratio': metrics.get('pe_ratio', 'N/A'),
-                    'CAPE Ratio': metrics.get('cape_ratio', 'N/A'),
-                    'Volatility (%)': metrics.get('volatility', 'N/A'),
-                    '52W High': metrics.get('52_week_high', 'N/A'),
-                    '52W Low': metrics.get('52_week_low', 'N/A')
-                })
+        progress_bar = st.progress(0)
+        total_tickers = len(mentions)
+        
+        for idx, ticker in enumerate(sorted(mentions.keys())):
+            metrics = get_enhanced_metrics(ticker)
+            company_info = get_company_info(ticker)
+            
+            metrics_data.append({
+                'Ticker': ticker,
+                'Company': company_info.get('name', ticker)[:20],
+                'Category': TICKER_CATEGORIES.get(ticker, 'N/A'),
+                'Price': metrics.get('price', 'N/A'),
+                'P/E Ratio': metrics.get('pe_ratio', 'N/A'),
+                'CAPE Ratio': metrics.get('cape_ratio', 'N/A'),
+                'Volatility (%)': metrics.get('volatility', 'N/A'),
+                '52W High': metrics.get('52_week_high', 'N/A'),
+                '52W Low': metrics.get('52_week_low', 'N/A'),
+                'Dividend Yield (%)': metrics.get('dividend_yield', 'N/A'),
+                'EPS': metrics.get('eps', 'N/A'),
+                'Profit Margin (%)': metrics.get('profit_margin', 'N/A')
+            })
+            
+            progress_bar.progress((idx + 1) / total_tickers)
         
         if metrics_data:
             metrics_df = pd.DataFrame(metrics_data)
@@ -954,23 +1025,41 @@ def render_analytics_dashboard(articles: List[Dict], recommendations: List[Dict]
                     'Ticker': st.column_config.TextColumn('Symbol', width='small'),
                     'Company': st.column_config.TextColumn('Company Name'),
                     'Category': st.column_config.TextColumn('Market Cap', width='small'),
+                    'Price': st.column_config.NumberColumn('Current Price', format='$%.2f'),
                     'P/E Ratio': st.column_config.NumberColumn('P/E Ratio', format='%.2f'),
                     'CAPE Ratio': st.column_config.TextColumn('CAPE Ratio', width='small'),
                     'Volatility (%)': st.column_config.NumberColumn('Volatility (%)', format='%.2f'),
-                    '52W High': st.column_config.NumberColumn('52-Week High', format='%.2f'),
-                    '52W Low': st.column_config.NumberColumn('52-Week Low', format='%.2f')
+                    '52W High': st.column_config.NumberColumn('52-Week High', format='$%.2f'),
+                    '52W Low': st.column_config.NumberColumn('52-Week Low', format='$%.2f'),
+                    'Dividend Yield (%)': st.column_config.NumberColumn('Dividend Yield (%)', format='%.2f'),
+                    'EPS': st.column_config.NumberColumn('EPS', format='$.2f'),
+                    'Profit Margin (%)': st.column_config.NumberColumn('Profit Margin (%)', format='%.2f')
                 }
             )
             
+            # Add CAPE ratio reference if available
+            cape_info = get_cape_ratio_approximation()
+            if cape_info['cape_ratio'] != 'N/A':
+                st.info(f"📊 **S&P 500 CAPE Ratio (Shiller P/E):** {cape_info['cape_ratio']} (as of {cape_info['cape_date']}) - Use this for market-wide valuation comparison")
+            
             st.markdown("""
             **Metric Definitions:**
-            - **P/E Ratio**: Price-to-Earnings ratio (lower typically = better value)
-            - **CAPE Ratio**: Cyclically Adjusted P/E (requires 10-year earnings history)
+            - **Price**: Current stock price
+            - **P/E Ratio**: Price-to-Earnings ratio (lower = potentially better value)
+            - **CAPE Ratio**: Cyclically Adjusted P/E (compares to 10-year historical earnings)
             - **Volatility (%)**: 90-day annualized return volatility (higher = more risk)
             - **52W High/Low**: 52-week trading range
+            - **Dividend Yield (%)**: Annual dividend as percentage of stock price
+            - **EPS**: Earnings Per Share (trailing 12 months)
+            - **Profit Margin (%)**: Net profit as percentage of revenue
+            
+            **Data Sources:** 
+            - Primary: yfinance (Yahoo Finance - free, no API key required)
+            - Secondary: Finnhub API (if configured)
+            - CAPE Ratio: FRED (Federal Reserve Economic Data - if configured)
             """)
         else:
-            st.info("Financial metrics data not available. Ensure Alpha Vantage API key is configured.")
+            st.info("Financial metrics data not available. Check if yfinance is installed.")
     
     st.markdown("---")
     
@@ -1062,29 +1151,48 @@ def main():
             """)
         
         with st.expander("🔑 API Configuration"):
-            st.info("AI Engine Status:")
-            if HF_API_KEY:
-                st.success("✅ Hugging Face API configured - Full AI explanations enabled")
-            else:
-                st.warning("⚠️ Using template explanations (no API key needed)")
+            col1, col2 = st.columns(2)
             
-            st.info("Financial Data Status:")
-            if ALPHA_VANTAGE_API_KEY != "demo":
-                st.success("✅ Alpha Vantage API configured - Full metrics enabled")
-            else:
-                st.warning("⚠️ Using demo mode - Limited financial data")
+            with col1:
+                st.subheader("AI Engine")
+                if HF_API_KEY:
+                    st.success("✅ Hugging Face configured")
+                else:
+                    st.warning("⚠️ Template mode")
+            
+            with col2:
+                st.subheader("Financial Data")
+                if yf is not None:
+                    st.success("✅ yfinance ready (no key needed!)")
+                else:
+                    st.error("❌ yfinance not installed")
+            
+            st.divider()
             
             st.markdown("""
-            **Optional APIs:**
-            1. **Hugging Face** (for AI explanations):
-               - Get free key: https://huggingface.co/settings/tokens
-               - Add to `.env`: `HF_API_KEY=hf_...`
+            **API Status:**
             
-            2. **Alpha Vantage** (for financial metrics):
-               - Get free key: https://www.alphavantage.co/api/
-               - Add to `.env`: `ALPHA_VANTAGE_API_KEY=...`
+            ✅ **yfinance** (PRIMARY - NO KEY NEEDED)
+            - Get P/E, Volatility, 52W High/Low
+            - No API key required
+            - Install: `pip install yfinance`
             
-            The app works great with or without API keys!
+            ⭐ **Finnhub** (OPTIONAL - BACKUP)
+            - Fallback data source
+            - Free tier: 60 calls/minute
+            - Get key: https://finnhub.io/
+            - Add to `.env`: `FINNHUB_API_KEY=...`
+            
+            ⭐ **FRED** (OPTIONAL - CAPE RATIO)
+            - S&P 500 Shiller P/E data
+            - Completely free
+            - Get key: https://fred.stlouisfed.org/docs/api/fred/
+            - Add to `.env`: `FRED_API_KEY=...`
+            
+            ⭐ **Hugging Face** (OPTIONAL - AI)
+            - Generate 500-word explanations
+            - Get key: https://huggingface.co/settings/tokens
+            - Add to `.env`: `HF_API_KEY=hf_...`
             """)
     
     # Main content
