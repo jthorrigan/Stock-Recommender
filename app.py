@@ -39,6 +39,7 @@ NEWS_SOURCES = {
     "MarketWatch": "https://feeds.marketwatch.com/marketwatch/topstories/",
     "Seeking Alpha": "https://seekingalpha.com/feed.xml",
     "CNBC": "https://feeds.cnbc.com/cnbc/financialnews/",
+    "The Economist": "https://www.economist.com/finance-and-economics/rss.xml",
 }
 
 SEC_FILINGS_API = "https://www.sec.gov/cgi-bin/browse-edgar"
@@ -165,8 +166,8 @@ def get_company_info(ticker: str) -> Dict:
 @st.cache_data(ttl=3600)
 def get_enhanced_metrics(ticker: str) -> Dict:
     """
-    Fetch comprehensive stock metrics using Alpha Vantage and Yahoo Finance free APIs
-    This is much more reliable than yfinance on Streamlit Cloud
+    Fetch comprehensive stock metrics using Finnhub, Alpha Vantage, and Yahoo Finance APIs
+    This is the most reliable approach on Streamlit Cloud
     
     Args:
         ticker: Stock ticker symbol
@@ -194,9 +195,90 @@ def get_enhanced_metrics(ticker: str) -> Dict:
     try:
         logger.info(f"Fetching metrics for {ticker} using free APIs")
         
-        # Primary source: Alpha Vantage GLOBAL_QUOTE
+        # Primary: Try Finnhub first (most reliable for comprehensive data)
+        if FINNHUB_API_KEY:
+            try:
+                logger.info(f"Fetching from Finnhub for {ticker}")
+                
+                # Get quote data
+                quote_url = f"https://finnhub.io/api/v1/quote?symbol={ticker}&token={FINNHUB_API_KEY}"
+                quote_response = requests.get(quote_url, timeout=5)
+                
+                if quote_response.status_code == 200:
+                    quote_data = quote_response.json()
+                    logger.info(f"Finnhub quote for {ticker}: {quote_data}")
+                    
+                    # Price
+                    if quote_data.get('c'):
+                        metrics['price'] = round(float(quote_data.get('c')), 2)
+                    
+                    # 52-week high/low
+                    if quote_data.get('h52'):
+                        metrics['52_week_high'] = round(float(quote_data.get('h52')), 2)
+                    if quote_data.get('l52'):
+                        metrics['52_week_low'] = round(float(quote_data.get('l52')), 2)
+                
+                # Get company profile for more metrics
+                profile_url = f"https://finnhub.io/api/v1/stock/profile2?symbol={ticker}&token={FINNHUB_API_KEY}"
+                profile_response = requests.get(profile_url, timeout=5)
+                
+                if profile_response.status_code == 200:
+                    profile_data = profile_response.json()
+                    logger.info(f"Finnhub profile for {ticker}: {profile_data}")
+                    
+                    if profile_data.get('marketCapitalization'):
+                        market_cap = profile_data.get('marketCapitalization')
+                        if market_cap >= 1e9:
+                            metrics['market_cap'] = f"${market_cap/1e9:.1f}B"
+                        elif market_cap >= 1e6:
+                            metrics['market_cap'] = f"${market_cap/1e6:.1f}M"
+                
+                # Get financials for EPS, P/E, etc
+                financials_url = f"https://finnhub.io/api/v1/stock/financials?symbol={ticker}&token={FINNHUB_API_KEY}"
+                financials_response = requests.get(financials_url, timeout=5)
+                
+                if financials_response.status_code == 200:
+                    financials_data = financials_response.json()
+                    logger.info(f"Finnhub financials for {ticker}: {financials_data}")
+                    
+                    if 'metric' in financials_data:
+                        metric_data = financials_data['metric']
+                        
+                        # P/E Ratio
+                        if metric_data.get('peRatioTTM'):
+                            pe = metric_data.get('peRatioTTM')
+                            if pe and pe > 0:
+                                metrics['pe_ratio'] = round(float(pe), 2)
+                        
+                        # EPS
+                        if metric_data.get('epsBasicExclExtraordinary'):
+                            eps = metric_data.get('epsBasicExclExtraordinary')
+                            if eps:
+                                metrics['eps'] = round(float(eps), 2)
+                        
+                        # Profit margin
+                        if metric_data.get('netProfitMargin'):
+                            margin = metric_data.get('netProfitMargin')
+                            if margin:
+                                metrics['profit_margin'] = round(float(margin) * 100, 2)
+                        
+                        # Dividend yield
+                        if metric_data.get('dividendYield'):
+                            div = metric_data.get('dividendYield')
+                            if div and div > 0:
+                                metrics['dividend_yield'] = round(float(div) * 100, 2)
+                
+                metrics['data_source'] = 'Finnhub'
+                logger.info(f"Final Finnhub metrics for {ticker}: {metrics}")
+                return metrics
+            
+            except Exception as fh_err:
+                logger.warning(f"Finnhub failed: {fh_err}")
+        
+        # Secondary: Alpha Vantage GLOBAL_QUOTE
         if ALPHA_VANTAGE_API_KEY != "demo":
             try:
+                logger.info(f"Fetching from Alpha Vantage for {ticker}")
                 params = {
                     'function': 'GLOBAL_QUOTE',
                     'symbol': ticker,
@@ -236,7 +318,7 @@ def get_enhanced_metrics(ticker: str) -> Dict:
             except Exception as av_err:
                 logger.warning(f"Alpha Vantage failed: {av_err}")
         
-        # Fallback: Yahoo Finance via free API endpoint
+        # Tertiary: Yahoo Finance via free API endpoint
         try:
             logger.info(f"Trying Yahoo Finance free endpoint for {ticker}")
             url = f"https://query1.finance.yahoo.com/v10/finance/quoteSummary/{ticker}?modules=price,financialData,defaultKeyStatistics"
@@ -299,32 +381,6 @@ def get_enhanced_metrics(ticker: str) -> Dict:
         
         except Exception as yf_err:
             logger.warning(f"Yahoo Finance endpoint failed: {yf_err}")
-        
-        # Final fallback: Finnhub
-        if FINNHUB_API_KEY:
-            try:
-                logger.info(f"Trying Finnhub for {ticker}")
-                finnhub_url = f"https://finnhub.io/api/v1/quote?symbol={ticker}&token={FINNHUB_API_KEY}"
-                response = requests.get(finnhub_url, timeout=5)
-                
-                if response.status_code == 200:
-                    finnhub_data = response.json()
-                    logger.info(f"Finnhub data for {ticker}: {finnhub_data}")
-                    
-                    if finnhub_data.get('c'):
-                        metrics['price'] = round(float(finnhub_data.get('c')), 2)
-                    if finnhub_data.get('pe'):
-                        metrics['pe_ratio'] = round(float(finnhub_data.get('pe')), 2)
-                    if finnhub_data.get('h52'):
-                        metrics['52_week_high'] = round(float(finnhub_data.get('h52')), 2)
-                    if finnhub_data.get('l52'):
-                        metrics['52_week_low'] = round(float(finnhub_data.get('l52')), 2)
-                    
-                    metrics['data_source'] = 'Finnhub'
-                    return metrics
-            
-            except Exception as fh_err:
-                logger.warning(f"Finnhub failed: {fh_err}")
         
         logger.error(f"All data sources failed for {ticker}")
         metrics['data_source'] = 'No Data Available - All APIs failed'
@@ -1115,12 +1171,12 @@ def render_analytics_dashboard(articles: List[Dict], recommendations: List[Dict]
             - **Dividend Yield (%)**: Annual dividend as percentage of stock price
             - **EPS**: Earnings Per Share
             - **Profit Margin (%)**: Net profit as percentage of revenue
-            - **Data Source**: Which API provided the metrics (Alpha Vantage, Yahoo Finance, or Finnhub)
+            - **Data Source**: Which API provided the metrics (Finnhub, Alpha Vantage, or Yahoo Finance)
             
             **Data Sources:** 
-            - Alpha Vantage (primary if API key configured)
-            - Yahoo Finance free endpoint (fallback)
-            - Finnhub API (if configured - for P/E ratio)
+            - Finnhub (primary if API key configured) - Most comprehensive data
+            - Alpha Vantage (secondary - if key configured)
+            - Yahoo Finance free endpoint (tertiary - automatic fallback)
             - FRED (Federal Reserve Economic Data - if configured for CAPE ratio)
             """)
         else:
@@ -1216,7 +1272,7 @@ def main():
         with st.expander("ℹ️ About"):
             st.markdown("""
             This app:
-            1. Crawls financial news from 6+ major sources daily
+            1. Crawls financial news from 7 major sources daily
             2. Analyzes coverage across all market cap categories
             3. Extracts stock & ETF mentions with sentiment analysis
             4. Analyzes fundamentals and market timing
@@ -1227,6 +1283,15 @@ def main():
             - Mid-Cap growth companies (CRWD, DDOG, etc.)
             - Small-Cap emerging companies (UPST, BREX, etc.)
             - ETFs (SPY, QQQ, sector ETFs, etc.)
+            
+            **News Sources:**
+            - Reuters
+            - Financial Times
+            - Bloomberg
+            - MarketWatch
+            - Seeking Alpha
+            - CNBC
+            - The Economist
             """)
         
         with st.expander("🔑 API Configuration"):
@@ -1241,41 +1306,43 @@ def main():
             
             with col2:
                 st.subheader("Financial Data")
-                if ALPHA_VANTAGE_API_KEY != "demo":
+                if FINNHUB_API_KEY:
+                    st.success("✅ Finnhub ready")
+                elif ALPHA_VANTAGE_API_KEY != "demo":
                     st.success("✅ Alpha Vantage ready")
                 else:
-                    st.warning("⚠️ Will try Yahoo Finance")
+                    st.warning("⚠️ Will use Yahoo Finance")
             
             st.divider()
             
             st.markdown("""
             **API Status:**
             
-            ✅ **Alpha Vantage** (PRIMARY - FREE TIER)
-            - Get real stock prices and 52W ranges
-            - Get API key: https://www.alphavantage.co/api/
-            - Add to `.env`: `ALPHA_VANTAGE_API_KEY=...`
-            
-            ✅ **Yahoo Finance** (FALLBACK - NO KEY NEEDED)
-            - Automatic fallback if Alpha Vantage unavailable
-            - Free public endpoint
-            
-            ⭐ **Finnhub** (OPTIONAL - P/E RATIO)
-            - Fallback data source for P/E ratio
+            ✅ **Finnhub** (PRIMARY - FREE TIER)
+            - Get comprehensive stock data
             - Free tier: 60 calls/minute
             - Get key: https://finnhub.io/
-            - Add to `.env`: `FINNHUB_API_KEY=...`
+            - Add to secrets: `FINNHUB_API_KEY=...`
+            
+            ✅ **Alpha Vantage** (SECONDARY - FREE TIER)
+            - Get real stock prices and 52W ranges
+            - Get API key: https://www.alphavantage.co/api/
+            - Add to secrets: `ALPHA_VANTAGE_API_KEY=...`
+            
+            ✅ **Yahoo Finance** (FALLBACK - NO KEY NEEDED)
+            - Automatic fallback if others unavailable
+            - Free public endpoint
             
             ⭐ **FRED** (OPTIONAL - CAPE RATIO)
             - S&P 500 Shiller P/E data
             - Completely free
             - Get key: https://fred.stlouisfed.org/docs/api/fred/
-            - Add to `.env`: `FRED_API_KEY=...`
+            - Add to secrets: `FRED_API_KEY=...`
             
             ⭐ **Hugging Face** (OPTIONAL - AI)
             - Generate 500-word explanations
             - Get key: https://huggingface.co/settings/tokens
-            - Add to `.env`: `HF_API_KEY=hf_...`
+            - Add to secrets: `HF_API_KEY=hf_...`
             """)
     
     # Main content
