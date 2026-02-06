@@ -1,6 +1,5 @@
 """
-Stock Recommendation Web App - Streamlit Application
-FINAL VERSION WITH CORRECT SECRET NAMES
+Stock Recommendation Web App - WITH SECRETS DIAGNOSTIC
 """
 
 import streamlit as st
@@ -21,18 +20,43 @@ logger = logging.getLogger(__name__)
 st.set_page_config(page_title="Stock Recommendation Engine", page_icon="📈", layout="wide")
 
 # ============================================================================
-# API KEY LOADING - EXACT NAMES FROM SECRETS
+# DIAGNOSTIC: SHOW WHAT'S IN SECRETS
 # ============================================================================
 
-# These match EXACTLY what's in your secrets.toml
+with st.sidebar:
+    with st.expander("🔍 Debug Secrets", expanded=True):
+        st.write("**All secrets keys:**")
+        try:
+            all_keys = list(st.secrets.keys())
+            for i, key in enumerate(all_keys):
+                st.write(f"{i}: `{key}`")
+        except Exception as e:
+            st.error(f"Error: {e}")
+        
+        st.divider()
+        st.write("**Key values (first 20 chars):**")
+        
+        fmp = st.secrets.get("fmp_api_key", "NOT FOUND")
+        st.write(f"`fmp_api_key`: {fmp[:20] if fmp != 'NOT FOUND' else fmp}...")
+        
+        eodhd = st.secrets.get("eodhd_api_key", "NOT FOUND")
+        st.write(f"`eodhd_api_key`: {eodhd[:20] if eodhd != 'NOT FOUND' else eodhd}...")
+        
+        fred = st.secrets.get("FRED_API_KEY", "NOT FOUND")
+        st.write(f"`FRED_API_KEY`: {fred[:20] if fred != 'NOT FOUND' else fred}...")
+
+# ============================================================================
+# API KEY LOADING
+# ============================================================================
+
 FMP_API_KEY = st.secrets.get("fmp_api_key", "")
 EODHD_API_KEY = st.secrets.get("eodhd_api_key", "")
 FRED_API_KEY = st.secrets.get("FRED_API_KEY", "")
 HF_API_KEY = st.secrets.get("HF_API_KEY", "")
 
-logger.info(f"✅ FMP loaded: {bool(FMP_API_KEY)}")
-logger.info(f"✅ EODHD loaded: {bool(EODHD_API_KEY)}")
-logger.info(f"✅ FRED loaded: {bool(FRED_API_KEY)}")
+logger.info(f"FMP: {bool(FMP_API_KEY)}")
+logger.info(f"EODHD: {bool(EODHD_API_KEY)}")
+logger.info(f"FRED: {bool(FRED_API_KEY)}")
 
 # API endpoints
 FMP_BASE_URL = "https://financialmodelingprep.com/api/v3"
