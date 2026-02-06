@@ -1,7 +1,7 @@
 """
 Stock Recommendation Web App - Streamlit Application
 Daily web crawler and AI-powered stock recommendations
-Uses multiple free data sources to minimize API requests
+Uses yfinance for best free stock data access
 """
 
 import streamlit as st
@@ -16,6 +16,15 @@ import logging
 import xml.etree.ElementTree as ET
 import re
 import numpy as np
+
+# Try to import yfinance for best free data
+try:
+    import yfinance as yf
+    YFINANCE_AVAILABLE = True
+except ImportError:
+    YFINANCE_AVAILABLE = False
+    logger = logging.getLogger(__name__)
+    logger.warning("yfinance not installed. Install with: pip install yfinance")
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -47,21 +56,18 @@ SEC_FILINGS_API = "https://www.sec.gov/cgi-bin/browse-edgar"
 
 # Try to load from Streamlit secrets first, fallback to environment variables
 try:
-    MARKETSTACK_API_KEY = st.secrets.get("marketstack_api_key", "")
     FINNHUB_API_KEY = st.secrets.get("finnhub_api_key", "")
     ALPHA_VANTAGE_API_KEY = st.secrets.get("alpha_vantage_api_key", "demo")
     HF_API_KEY = st.secrets.get("hf_api_key", "")
     FRED_API_KEY = st.secrets.get("fred_api_key", "")
 except:
     # Fallback to environment variables
-    MARKETSTACK_API_KEY = os.getenv("MARKETSTACK_API_KEY", "")
     FINNHUB_API_KEY = os.getenv("FINNHUB_API_KEY", "")
     ALPHA_VANTAGE_API_KEY = os.getenv("ALPHA_VANTAGE_API_KEY", "demo")
     HF_API_KEY = os.getenv("HF_API_KEY", "")
     FRED_API_KEY = os.getenv("FRED_API_KEY", "")
 
 # API base URLs
-MARKETSTACK_BASE_URL = "http://api.marketstack.com/v1"
 FINNHUB_BASE_URL = "https://finnhub.io/api/v1"
 ALPHA_VANTAGE_BASE_URL = "https://www.alphavantage.co/query"
 
@@ -109,7 +115,7 @@ def clear_cache():
 @st.cache_data(ttl=86400)
 def get_company_info(ticker: str) -> Dict:
     """
-    Fetch company information - uses Alpha Vantage first (limited), then Yahoo
+    Fetch company information using yfinance
     
     Args:
         ticker: Stock ticker symbol
@@ -118,85 +124,64 @@ def get_company_info(ticker: str) -> Dict:
         Dictionary with company info
     """
     try:
-        # Try Alpha Vantage first (only 5 calls/min, so use sparingly)
-        if ALPHA_VANTAGE_API_KEY != "demo":
-            try:
-                logger.info(f"Fetching company info from Alpha Vantage for {ticker}")
-                params = {
-                    'function': 'OVERVIEW',
-                    'symbol': ticker,
-                    'apikey': ALPHA_VANTAGE_API_KEY
-                }
-                response = requests.get(ALPHA_VANTAGE_BASE_URL, params=params, timeout=10)
-                response.raise_for_status()
-                data = response.json()
-                
-                if 'Name' in data and data.get('Name'):
-                    market_cap = data.get('MarketCapitalization', '0')
-                    try:
-                        market_cap_num = int(market_cap) if market_cap else 0
-                    except:
-                        market_cap_num = 0
-                    
-                    market_cap_str = 'Unknown'
-                    if market_cap_num >= 1e9:
-                        market_cap_str = f"${market_cap_num/1e9:.1f}B"
-                    elif market_cap_num >= 1e6:
-                        market_cap_str = f"${market_cap_num/1e6:.1f}M"
-                    
-                    return {
-                        'ticker': ticker,
-                        'name': data.get('Name', ticker),
-                        'sector': data.get('Sector', 'Unknown'),
-                        'industry': data.get('Industry', 'Unknown'),
-                        'description': data.get('Description', ''),
-                        'market_cap': market_cap_str,
-                        'market_cap_numeric': market_cap_num,
-                        'category': TICKER_CATEGORIES.get(ticker, 'Unknown'),
-                        'pe_ratio': 'N/A',
-                        'profit_margin': 'N/A',
-                        'eps': 'N/A',
-                        'data_source': 'Alpha Vantage'
-                    }
-            except Exception as e:
-                logger.debug(f"Alpha Vantage company info failed: {e}")
+        if not YFINANCE_AVAILABLE:
+            return _get_company_info_fallback(ticker)
         
-        # Fallback: Use cached ticker info
+        logger.info(f"Fetching company info from yfinance for {ticker}")
+        
+        ticker_obj = yf.Ticker(ticker)
+        info = ticker_obj.info
+        
+        if not info or 'longName' not in info:
+            return _get_company_info_fallback(ticker)
+        
+        market_cap = info.get('marketCap', 0)
+        market_cap_str = 'Unknown'
+        if market_cap and market_cap > 0:
+            if market_cap >= 1e9:
+                market_cap_str = f"${market_cap/1e9:.1f}B"
+            elif market_cap >= 1e6:
+                market_cap_str = f"${market_cap/1e6:.1f}M"
+        
         return {
             'ticker': ticker,
-            'name': ticker,
-            'sector': 'Unknown',
-            'industry': 'Unknown',
-            'market_cap': 'Unknown',
-            'market_cap_numeric': 0,
+            'name': info.get('longName', ticker),
+            'sector': info.get('sector', 'Unknown'),
+            'industry': info.get('industry', 'Unknown'),
+            'description': info.get('longBusinessSummary', ''),
+            'market_cap': market_cap_str,
+            'market_cap_numeric': market_cap if market_cap else 0,
             'category': TICKER_CATEGORIES.get(ticker, 'Unknown'),
             'pe_ratio': 'N/A',
             'profit_margin': 'N/A',
             'eps': 'N/A',
-            'data_source': 'Cache'
+            'data_source': 'yfinance'
         }
     
     except Exception as e:
         logger.warning(f"Error fetching company info for {ticker}: {str(e)}")
-        return {
-            'ticker': ticker,
-            'name': ticker,
-            'sector': 'Unknown',
-            'industry': 'Unknown',
-            'market_cap': 'Unknown',
-            'market_cap_numeric': 0,
-            'category': TICKER_CATEGORIES.get(ticker, 'Unknown'),
-            'pe_ratio': 'N/A',
-            'profit_margin': 'N/A',
-            'eps': 'N/A',
-            'data_source': 'Error'
-        }
+        return _get_company_info_fallback(ticker)
+
+def _get_company_info_fallback(ticker: str) -> Dict:
+    """Fallback company info when yfinance fails"""
+    return {
+        'ticker': ticker,
+        'name': ticker,
+        'sector': 'Unknown',
+        'industry': 'Unknown',
+        'market_cap': 'Unknown',
+        'market_cap_numeric': 0,
+        'category': TICKER_CATEGORIES.get(ticker, 'Unknown'),
+        'pe_ratio': 'N/A',
+        'profit_margin': 'N/A',
+        'eps': 'N/A',
+        'data_source': 'Cache'
+    }
 
 def is_metrics_complete(metrics: Dict) -> bool:
     """
     Check if metrics have sufficient data
     Accept data if we have price + any other metric
-    This is realistic for free tier APIs
     
     Args:
         metrics: Dictionary with metrics
@@ -216,17 +201,15 @@ def is_metrics_complete(metrics: Dict) -> bool:
             data_count += 1
     
     # Consider complete if we have at least price + 1 other metric
-    # This is realistic for free tier (we won't get everything)
     return data_count >= 2
 
 @st.cache_data(ttl=3600)
 def get_enhanced_metrics(ticker: str) -> Dict:
     """
     Fetch stock metrics - PRIORITY ORDER:
-    1. Yahoo Finance (FREE - NO LIMITS) - Gets price, P/E, 52W, market cap
-    2. Finnhub (FREE - 60/min) - Fallback for price/P/E
-    3. Alpha Vantage (LIMITED - 5/min) - Fallback
-    4. Marketstack (PAID - OHLCV only) - Final fallback for price/52W
+    1. yfinance (FREE - BEST for market cap + all basic data)
+    2. Finnhub (FREE - 60/min, has P/E)
+    3. Alpha Vantage (LIMITED - 5/min)
     
     Args:
         ticker: Stock ticker symbol
@@ -254,89 +237,89 @@ def get_enhanced_metrics(ticker: str) -> Dict:
     try:
         logger.info(f"Fetching metrics for {ticker}")
         
-        # PRIMARY: Yahoo Finance (FREE - unlimited requests)
-        try:
-            logger.info(f"[1/4] Trying Yahoo Finance for {ticker}")
-            
-            url = f"https://query1.finance.yahoo.com/v10/finance/quoteSummary/{ticker.upper()}?modules=price,financialData,defaultKeyStatistics,summaryDetail"
-            headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
-            response = requests.get(url, headers=headers, timeout=10)
-            
-            if response.status_code == 200:
-                data = response.json()
+        # PRIMARY: yfinance (FREE - best for comprehensive data including market cap)
+        if YFINANCE_AVAILABLE:
+            try:
+                logger.info(f"[1/3] Trying yfinance for {ticker}")
                 
-                if 'quoteSummary' in data and 'result' in data['quoteSummary'] and len(data['quoteSummary']['result']) > 0:
-                    result = data['quoteSummary']['result'][0]
-                    
+                ticker_obj = yf.Ticker(ticker)
+                info = ticker_obj.info
+                
+                if info:
                     # Price
-                    if 'price' in result and 'regularMarketPrice' in result['price']:
-                        try:
-                            price_val = result['price']['regularMarketPrice']['raw']
-                            metrics['price'] = round(float(price_val), 2)
-                            logger.info(f"{ticker} price: ${metrics['price']}")
-                        except Exception as e:
-                            logger.debug(f"Price extraction failed: {e}")
+                    if 'currentPrice' in info:
+                        metrics['price'] = round(float(info.get('currentPrice')), 2)
+                        logger.info(f"{ticker} price: ${metrics['price']}")
+                    elif 'regularMarketPrice' in info:
+                        metrics['price'] = round(float(info.get('regularMarketPrice')), 2)
                     
                     # P/E Ratio
-                    if 'summaryDetail' in result and 'trailingPE' in result['summaryDetail']:
+                    if 'trailingPE' in info:
                         try:
-                            pe = result['summaryDetail']['trailingPE']['raw']
+                            pe = info.get('trailingPE')
                             if pe and pe > 0:
                                 metrics['pe_ratio'] = round(float(pe), 2)
                                 logger.info(f"{ticker} P/E: {metrics['pe_ratio']}")
                         except:
                             pass
                     
-                    # 52-week high/low and market cap
-                    if 'summaryDetail' in result:
-                        detail = result['summaryDetail']
-                        
-                        if 'fiftyTwoWeekHigh' in detail:
-                            try:
-                                metrics['52_week_high'] = round(float(detail['fiftyTwoWeekHigh']['raw']), 2)
-                            except:
-                                pass
-                        
-                        if 'fiftyTwoWeekLow' in detail:
-                            try:
-                                metrics['52_week_low'] = round(float(detail['fiftyTwoWeekLow']['raw']), 2)
-                            except:
-                                pass
-                        
-                        # Market cap
-                        if 'marketCap' in detail:
-                            try:
-                                market_cap = detail['marketCap']['raw']
+                    # 52-week high/low
+                    if 'fiftyTwoWeekHigh' in info:
+                        try:
+                            metrics['52_week_high'] = round(float(info.get('fiftyTwoWeekHigh')), 2)
+                        except:
+                            pass
+                    
+                    if 'fiftyTwoWeekLow' in info:
+                        try:
+                            metrics['52_week_low'] = round(float(info.get('fiftyTwoWeekLow')), 2)
+                        except:
+                            pass
+                    
+                    # Market cap - THIS IS WHERE yfinance SHINES
+                    if 'marketCap' in info:
+                        try:
+                            market_cap = info.get('marketCap')
+                            if market_cap and market_cap > 0:
                                 if market_cap >= 1e9:
                                     metrics['market_cap'] = f"${market_cap/1e9:.1f}B"
                                 elif market_cap >= 1e6:
                                     metrics['market_cap'] = f"${market_cap/1e6:.1f}M"
-                            except:
-                                pass
-                        
-                        # Dividend yield
-                        if 'trailingAnnualDividendYield' in detail:
-                            try:
-                                div = detail['trailingAnnualDividendYield']['raw']
-                                if div and div > 0:
-                                    metrics['dividend_yield'] = round(float(div) * 100, 2)
-                            except:
-                                pass
+                        except:
+                            pass
+                    
+                    # Dividend yield
+                    if 'trailingAnnualDividendYield' in info:
+                        try:
+                            div = info.get('trailingAnnualDividendYield')
+                            if div and div > 0:
+                                metrics['dividend_yield'] = round(float(div) * 100, 2)
+                        except:
+                            pass
+                    
+                    # EPS
+                    if 'trailingEps' in info:
+                        try:
+                            eps = info.get('trailingEps')
+                            if eps:
+                                metrics['eps'] = round(float(eps), 2)
+                        except:
+                            pass
                     
                     if is_metrics_complete(metrics):
-                        metrics['data_source'] = 'Yahoo Finance'
-                        logger.info(f"✅ Yahoo Finance complete for {ticker}")
+                        metrics['data_source'] = 'yfinance'
+                        logger.info(f"✅ yfinance complete for {ticker}")
                         return metrics
                     else:
-                        logger.info(f"⚠️ Yahoo Finance has price, trying next source for more data")
+                        logger.info(f"⚠️ yfinance has price, trying Finnhub for more data")
+            
+            except Exception as yf_err:
+                logger.debug(f"yfinance failed: {yf_err}")
         
-        except Exception as yf_err:
-            logger.debug(f"Yahoo Finance failed: {yf_err}")
-        
-        # SECONDARY: Finnhub (FREE - 60 calls/min, has better P/E data)
+        # SECONDARY: Finnhub (FREE - 60 calls/min)
         if FINNHUB_API_KEY and metrics['price'] != 'N/A':
             try:
-                logger.info(f"[2/4] Trying Finnhub for {ticker}")
+                logger.info(f"[2/3] Trying Finnhub for {ticker}")
                 
                 quote_url = f"{FINNHUB_BASE_URL}/quote?symbol={ticker.upper()}&token={FINNHUB_API_KEY}"
                 quote_response = requests.get(quote_url, timeout=5)
@@ -358,25 +341,23 @@ def get_enhanced_metrics(ticker: str) -> Dict:
                     if metrics['52_week_low'] == 'N/A' and quote_data.get('l52'):
                         metrics['52_week_low'] = round(float(quote_data.get('l52')), 2)
                     
-                    if metrics['data_source'] == 'None' or metrics['data_source'] == 'Yahoo Finance':
-                        metrics['data_source'] = 'Yahoo Finance + Finnhub'
-                    
+                    metrics['data_source'] = 'yfinance + Finnhub'
                     logger.info(f"Finnhub supplemented data for {ticker}")
                     return metrics
             
             except Exception as fh_err:
                 logger.debug(f"Finnhub failed: {fh_err}")
         
-        # If we already have price from Yahoo, we're good - return it
+        # If we already have price from yfinance, return it
         if metrics['price'] != 'N/A':
-            metrics['data_source'] = 'Yahoo Finance'
-            logger.info(f"✅ Returning Yahoo Finance data for {ticker}")
+            metrics['data_source'] = 'yfinance'
+            logger.info(f"✅ Returning yfinance data for {ticker}")
             return metrics
         
         # TERTIARY: Alpha Vantage (LIMITED - 5 calls/min)
         if ALPHA_VANTAGE_API_KEY != "demo":
             try:
-                logger.info(f"[3/4] Trying Alpha Vantage for {ticker}")
+                logger.info(f"[3/3] Trying Alpha Vantage for {ticker}")
                 
                 params = {
                     'function': 'GLOBAL_QUOTE',
@@ -403,40 +384,6 @@ def get_enhanced_metrics(ticker: str) -> Dict:
             
             except Exception as av_err:
                 logger.debug(f"Alpha Vantage failed: {av_err}")
-        
-        # QUATERNARY: Marketstack (PAID - OHLCV only, no fundamentals)
-        # Note: Marketstack free tier only has price/OHLCV, not P/E, EPS, dividends, etc
-        if MARKETSTACK_API_KEY and metrics['price'] == 'N/A':
-            try:
-                logger.info(f"[4/4] Trying Marketstack for {ticker} (paid quota - limited data)")
-                
-                url = f"{MARKETSTACK_BASE_URL}/eod"
-                params = {
-                    'access_key': MARKETSTACK_API_KEY,
-                    'symbols': ticker.upper(),
-                    'limit': 1
-                }
-                response = requests.get(url, params=params, timeout=10)
-                response.raise_for_status()
-                data = response.json()
-                
-                if data.get('data') and len(data['data']) > 0:
-                    result = data['data'][0]
-                    
-                    if result.get('close'):
-                        metrics['price'] = round(float(result.get('close')), 2)
-                    if result.get('high'):
-                        metrics['52_week_high'] = round(float(result.get('high')), 2)
-                    if result.get('low'):
-                        metrics['52_week_low'] = round(float(result.get('low')), 2)
-                    
-                    if metrics['price'] != 'N/A':
-                        metrics['data_source'] = 'Marketstack (OHLCV only)'
-                        logger.info(f"✅ Marketstack price for {ticker}")
-                        return metrics
-            
-            except Exception as ms_err:
-                logger.debug(f"Marketstack failed: {ms_err}")
         
         # Return what we have
         if metrics['price'] != 'N/A':
@@ -641,7 +588,7 @@ def extract_stock_mentions(articles: List[Dict]) -> Dict[str, List]:
 
 def get_stock_fundamentals(ticker: str) -> Dict:
     """
-    Fetch stock fundamentals - prioritize free sources
+    Fetch stock fundamentals - uses yfinance
     
     Args:
         ticker: Stock ticker symbol
@@ -650,18 +597,15 @@ def get_stock_fundamentals(ticker: str) -> Dict:
         Dictionary with stock data
     """
     try:
-        # Use Alpha Vantage only if configured
-        if ALPHA_VANTAGE_API_KEY != "demo":
-            params = {
-                'function': 'OVERVIEW',
-                'symbol': ticker,
-                'apikey': ALPHA_VANTAGE_API_KEY
-            }
-            response = requests.get(ALPHA_VANTAGE_BASE_URL, params=params, timeout=10)
-            response.raise_for_status()
-            return response.json()
+        if not YFINANCE_AVAILABLE:
+            return {}
         
-        return {}
+        logger.info(f"Fetching fundamentals from yfinance for {ticker}")
+        ticker_obj = yf.Ticker(ticker)
+        info = ticker_obj.info
+        
+        return info if info else {}
+    
     except Exception as e:
         logger.debug(f"Error fetching fundamentals for {ticker}: {str(e)}")
         return {}
@@ -800,7 +744,7 @@ def generate_template_explanation(
         500-word explanation
     """
     
-    sector = fundamentals.get('Sector', 'the technology sector')
+    sector = fundamentals.get('sector', 'the technology sector')
     recent_news = articles[0]['title'] if articles else "Recent market developments"
     
     explanation = f"""
@@ -939,7 +883,7 @@ def generate_recommendations(
     return recommendations
 
 # ============================================================================
-# STREAMLIT UI
+# STREAMLIT UI - SIMPLIFIED
 # ============================================================================
 
 def render_recommendation_card(rec: Dict):
@@ -955,9 +899,7 @@ def render_recommendation_card(rec: Dict):
         st.metric("Confidence", f"{rec['confidence_score']:.0%}")
     
     st.info(f"📊 **Confidence Rationale:** {rec['confidence_justification']}")
-    
     st.markdown("---")
-    
     st.markdown("### Investment Thesis (12-24 Month Outlook)")
     st.markdown(rec['explanation'])
     
@@ -977,27 +919,23 @@ def render_recommendation_card(rec: Dict):
                     st.markdown(f"[🔗 Read Full Article]({source['link']})")
                 st.markdown(f"**Summary:** {source['summary']}")
     else:
-        st.info("No source articles available for this recommendation")
+        st.info("No source articles available")
     
     st.markdown("---\n")
 
 def render_crawl_status(articles: List[Dict]):
     """Render web crawl status and metrics"""
-    
     col1, col2, col3, col4 = st.columns(4)
     
     with col1:
         st.metric("Articles Crawled", len(articles))
-    
     with col2:
         sources = len(set(a['source'] for a in articles))
         st.metric("News Sources", sources)
-    
     with col3:
         if articles:
             latest = max(articles, key=lambda x: x['crawled_at'])
             st.metric("Last Crawl", latest['crawled_at'][:10])
-    
     with col4:
         st.metric("Update Status", "✅ Current" if articles else "⚠️ Pending")
 
@@ -1023,14 +961,9 @@ def render_analytics_dashboard(articles: List[Dict], recommendations: List[Dict]
     if articles:
         mentions = extract_stock_mentions(articles)
         
-        category_data = {
-            'Large-Cap': 0,
-            'Mid-Cap': 0,
-            'Small-Cap': 0,
-            'ETF': 0
-        }
-        
+        category_data = {'Large-Cap': 0, 'Mid-Cap': 0, 'Small-Cap': 0, 'ETF': 0}
         ticker_mentions = []
+        
         for ticker, articles_list in mentions.items():
             category = TICKER_CATEGORIES.get(ticker, 'Unknown')
             if category in category_data:
@@ -1049,27 +982,16 @@ def render_analytics_dashboard(articles: List[Dict], recommendations: List[Dict]
                 list(category_data.items()),
                 columns=['Category', 'Mentions']
             ).sort_values('Mentions', ascending=False)
-            
-            st.bar_chart(
-                category_df.set_index('Category'),
-                use_container_width=True,
-                height=300
-            )
+            st.bar_chart(category_df.set_index('Category'), use_container_width=True, height=300)
         
         with col2:
             st.markdown("**Top 10 Mentioned Tickers**")
             top_tickers_df = pd.DataFrame(ticker_mentions).sort_values('Mentions', ascending=False).head(10)
-            
-            st.bar_chart(
-                top_tickers_df.set_index('Ticker')['Mentions'],
-                use_container_width=True,
-                height=300
-            )
+            st.bar_chart(top_tickers_df.set_index('Ticker')['Mentions'], use_container_width=True, height=300)
         
         st.markdown("---")
         
         st.markdown("### 📋 Detailed Ticker Mentions")
-        
         detailed_df = pd.DataFrame(ticker_mentions).sort_values('Mentions', ascending=False)
         detailed_df['Mentions'] = detailed_df['Mentions'].astype(int)
         
@@ -1083,21 +1005,18 @@ def render_analytics_dashboard(articles: List[Dict], recommendations: List[Dict]
                 'Category': st.column_config.TextColumn('Market Cap Category')
             }
         )
-    
     else:
         st.info("Run the web crawler to see analytics data")
     
     st.markdown("---")
     
     st.markdown("### 💹 Company Financial Metrics")
-    st.markdown("*Yahoo Finance (primary) → Finnhub (supplement) → Alpha Vantage/Marketstack (fallback)*")
+    st.markdown("*Data from yfinance (no API key required)*")
     
     if articles:
         mentions = extract_stock_mentions(articles)
-        
         metrics_data = []
         progress_bar = st.progress(0)
-        total_tickers = len(mentions)
         
         for idx, ticker in enumerate(sorted(mentions.keys())):
             metrics = get_enhanced_metrics(ticker)
@@ -1115,12 +1034,10 @@ def render_analytics_dashboard(articles: List[Dict], recommendations: List[Dict]
                 'Div. Yield %': metrics.get('dividend_yield', 'N/A'),
                 'Data Source': metrics.get('data_source', 'N/A')
             })
-            
-            progress_bar.progress((idx + 1) / total_tickers)
+            progress_bar.progress((idx + 1) / len(mentions))
         
         if metrics_data:
             metrics_df = pd.DataFrame(metrics_data)
-            
             st.dataframe(
                 metrics_df,
                 use_container_width=True,
@@ -1144,60 +1061,26 @@ def render_analytics_dashboard(articles: List[Dict], recommendations: List[Dict]
                 st.info(f"📊 **S&P 500 CAPE Ratio (Shiller P/E):** {cape_info['cape_ratio']} (as of {cape_info['cape_date']})")
             
             st.markdown("""
-            **About Free API Limitations:**
+            **⭐ Why yfinance is BETTER than Marketstack:**
             
-            ✅ **Yahoo Finance** (PRIMARY - No key needed)
-            - ✅ Price, P/E, 52W High/Low, Market Cap, Dividend Yield
-            - ✅ Most reliable and comprehensive free source
-            - Unlimited requests
+            ✅ **yfinance**
+            - ✅ No API key required
+            - ✅ Includes market cap reliably
+            - ✅ Includes P/E ratio, dividend yield, EPS
+            - ✅ Unlimited requests
+            - ✅ Company sector & industry data
+            - 💰 Cost: $0/month
             
-            ⭐ **Finnhub** (OPTIONAL - Free tier: 60 calls/min)
-            - Supplements Yahoo data (P/E, 52W ranges)
-            - Get key: https://finnhub.io/
+            ❌ **Marketstack free tier**
+            - ❌ Only 100 requests/month
+            - ❌ MISSING market cap
+            - ❌ MISSING P/E ratio
+            - ❌ MISSING dividend yield
+            - ❌ OHLCV data only (price, open, high, low, volume)
+            - 💰 Cost: $0 free, but $99+/month for useful data
             
-            ⚠️ **Marketstack** (LIMITED - Free: 100 req/month)
-            - Only provides OHLCV (Open, High, Low, Close, Volume)
-            - Does NOT include: P/E, EPS, dividend yield, market cap
-            - Not recommended unless you need guaranteed price data
-            - Consider paid alternatives if needed
-            
-            ❌ **Reality Check:**
-            - No free API provides complete fundamental data
-            - P/E, EPS, margins, etc. are behind paywalls
-            - Marketstack free tier is very limited
-            - Best strategy: Use Yahoo Finance + optional Finnhub
+            **Recommendation:** Use yfinance exclusively - no other API needed!
             """)
-        else:
-            st.info("Financial metrics data not available. Check your network connection.")
-    
-    st.markdown("---")
-    
-    if recommendations:
-        st.markdown("### 🎯 Recommendations Summary")
-        
-        rec_df = pd.DataFrame([
-            {
-                'Ticker': r['ticker'],
-                'Company': r['company_name'],
-                'Category': r['category'],
-                'Confidence': f"{r['confidence_score']:.0%}",
-                'Sector': r['sector']
-            }
-            for r in recommendations
-        ])
-        
-        st.dataframe(
-            rec_df,
-            use_container_width=True,
-            hide_index=True,
-            column_config={
-                'Ticker': st.column_config.TextColumn('Symbol'),
-                'Company': st.column_config.TextColumn('Company Name'),
-                'Category': st.column_config.TextColumn('Market Cap'),
-                'Confidence': st.column_config.TextColumn('Confidence Level'),
-                'Sector': st.column_config.TextColumn('Sector')
-            }
-        )
 
 def main():
     """Main Streamlit application"""
@@ -1205,7 +1088,11 @@ def main():
     init_session()
     
     st.title("📈 Stock Recommendation Engine")
-    st.markdown("AI-powered daily stock recommendations | Optimized for free APIs (Yahoo Finance first, fallbacks for missing data)")
+    st.markdown("AI-powered daily stock recommendations | Powered by yfinance (no API keys needed!)")
+    
+    if not YFINANCE_AVAILABLE:
+        st.error("❌ yfinance not installed! Run: `pip install yfinance`")
+        return
     
     with st.sidebar:
         st.header("⚙️ Controls")
@@ -1221,10 +1108,8 @@ def main():
             if not st.session_state.crawled_articles:
                 st.warning("Please run crawler first")
             else:
-                with st.spinner("Analyzing articles and generating recommendations..."):
-                    recommendations = generate_recommendations(
-                        st.session_state.crawled_articles
-                    )
+                with st.spinner("Analyzing articles..."):
+                    recommendations = generate_recommendations(st.session_state.crawled_articles)
                     st.session_state.recommendations = recommendations
                     st.success("✅ Recommendations generated")
         
@@ -1242,90 +1127,32 @@ def main():
             st.success("Cache cleared!")
         
         st.divider()
-        
-        num_recs = st.slider(
-            "Number of Recommendations",
-            min_value=1,
-            max_value=10,
-            value=5
-        )
-        
+        num_recs = st.slider("Number of Recommendations", 1, 10, 5)
         st.divider()
         
         with st.expander("ℹ️ About"):
             st.markdown("""
-            This app:
-            1. Crawls financial news from 7 major sources daily
-            2. Analyzes coverage across all market cap categories
-            3. Extracts stock & ETF mentions
-            4. Analyzes fundamentals using free APIs
-            5. Generates recommendations with source links
-            
-            **Data Reality:**
-            - Yahoo Finance is best for free comprehensive data
-            - Some metrics (EPS, margins) require paid APIs
-            - We show what's available, mark N/A for missing data
+            Stock Recommendation Engine using:
+            - yfinance for all stock data (no API key!)
+            - News crawling from 7 financial sources
+            - AI-generated investment theses
             """)
         
         with st.expander("🔑 API Configuration"):
-            col1, col2 = st.columns(2)
-            
-            with col1:
-                st.subheader("AI Engine")
-                if HF_API_KEY:
-                    st.success("✅ Hugging Face configured")
-                else:
-                    st.warning("⚠️ Template mode")
-            
-            with col2:
-                st.subheader("Financial Data")
-                st.success("✅ Yahoo Finance (always available)")
-                if FINNHUB_API_KEY:
-                    st.success("✅ Finnhub (optional supplement)")
-                if ALPHA_VANTAGE_API_KEY != "demo":
-                    st.success("✅ Alpha Vantage (optional)")
-                if MARKETSTACK_API_KEY:
-                    st.warning("⚠️ Marketstack (limited free tier)")
-            
-            st.divider()
-            
-            st.markdown("""
-            **Free API Reality Check:**
-            
-            ✅ **Yahoo Finance** (No API Key Needed)
-            - Best free source for stock data
-            - Gets: Price, P/E, 52W High/Low, Market Cap, Dividend Yield
-            - No rate limits, unlimited requests
-            - **Recommended: USE THIS**
-            
-            ⭐ **Finnhub** (Optional - Free Tier)
-            - Free tier: 60 calls/minute
-            - Supplements Yahoo data
-            - Get key: https://finnhub.io/
-            
-            ⚠️ **Marketstack** (Not Recommended - Limited Free Tier)
-            - Free tier: Only 100 requests/month
-            - Only provides: Price, Open, High, Low, Close, Volume
-            - MISSING: P/E Ratio, EPS, Dividends, Margins, Market Cap
-            - Cost: $99/month for better tier
-            - **Conclusion: Not worth the paid cost**
-            
-            ❌ **Why P/E, EPS Missing?**
-            - These are fundamentals, not just price data
-            - Only available via expensive Bloomberg terminals or paid APIs
-            - No free source provides complete fundamentals
-            
-            **Bottom Line:**
-            Use Yahoo Finance (free, no key). Add Finnhub if you want backup.
-            Skip Marketstack - not worth it for free users.
-            """)
+            st.success("✅ yfinance (primary - no key needed)")
+            if FINNHUB_API_KEY:
+                st.success("✅ Finnhub (optional fallback)")
+            if HF_API_KEY:
+                st.success("✅ Hugging Face (optional AI)")
+            if FRED_API_KEY:
+                st.success("✅ FRED (optional macro data)")
     
     if st.session_state.last_crawl:
         tab1, tab2, tab3 = st.tabs(["📋 Recommendations", "📰 Crawl Data", "📊 Analytics"])
         
         with tab1:
             if st.session_state.recommendations:
-                st.subheader(f"Top {len(st.session_state.recommendations)} Stock Recommendations")
+                st.subheader(f"Top {len(st.session_state.recommendations)} Recommendations")
                 for i, rec in enumerate(st.session_state.recommendations[:num_recs], 1):
                     st.markdown(f"### #{i} - {rec['company_name']} ({rec['ticker']})")
                     render_recommendation_card(rec)
@@ -1342,25 +1169,17 @@ def main():
                 st.dataframe(
                     articles_df[['source', 'title', 'published']].head(20),
                     use_container_width=True,
-                    hide_index=True,
-                    column_config={
-                        'source': st.column_config.TextColumn('News Source'),
-                        'title': st.column_config.TextColumn('Article Title'),
-                        'published': st.column_config.TextColumn('Published Date')
-                    }
+                    hide_index=True
                 )
         
         with tab3:
-            render_analytics_dashboard(
-                st.session_state.crawled_articles,
-                st.session_state.recommendations
-            )
+            render_analytics_dashboard(st.session_state.crawled_articles, st.session_state.recommendations)
     else:
         col1, col2 = st.columns(2)
         with col1:
-            st.info("👈 Start by running the web crawler in the sidebar")
+            st.info("👈 Start by running the web crawler")
         with col2:
-            st.info("Then generate recommendations based on crawled data")
+            st.info("Then generate recommendations")
 
 if __name__ == "__main__":
     main()
