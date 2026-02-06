@@ -44,11 +44,21 @@ NEWS_SOURCES = {
 }
 
 SEC_FILINGS_API = "https://www.sec.gov/cgi-bin/browse-edgar"
-MARKETSTACK_API_KEY = os.getenv("MARKETSTACK_API_KEY", "")
-FINNHUB_API_KEY = os.getenv("FINNHUB_API_KEY", "")
-ALPHA_VANTAGE_API_KEY = os.getenv("ALPHA_VANTAGE_API_KEY", "demo")
-HF_API_KEY = os.getenv("HF_API_KEY", "")
-FRED_API_KEY = os.getenv("FRED_API_KEY", "")
+
+# Try to load from Streamlit secrets first, fallback to environment variables
+try:
+    MARKETSTACK_API_KEY = st.secrets.get("marketstack_api_key", "")
+    FINNHUB_API_KEY = st.secrets.get("finnhub_api_key", "")
+    ALPHA_VANTAGE_API_KEY = st.secrets.get("alpha_vantage_api_key", "demo")
+    HF_API_KEY = st.secrets.get("hf_api_key", "")
+    FRED_API_KEY = st.secrets.get("fred_api_key", "")
+except:
+    # Fallback to environment variables
+    MARKETSTACK_API_KEY = os.getenv("MARKETSTACK_API_KEY", "")
+    FINNHUB_API_KEY = os.getenv("FINNHUB_API_KEY", "")
+    ALPHA_VANTAGE_API_KEY = os.getenv("ALPHA_VANTAGE_API_KEY", "demo")
+    HF_API_KEY = os.getenv("HF_API_KEY", "")
+    FRED_API_KEY = os.getenv("FRED_API_KEY", "")
 
 # API base URLs
 MARKETSTACK_BASE_URL = "http://api.marketstack.com/v1"
@@ -170,6 +180,31 @@ def get_company_info(ticker: str) -> Dict:
             'data_source': 'Error'
         }
 
+def is_metrics_complete(metrics: Dict) -> bool:
+    """
+    Check if metrics have sufficient data
+    Need at least price and one other metric to consider it complete
+    
+    Args:
+        metrics: Dictionary with metrics
+    
+    Returns:
+        True if metrics are considered complete
+    """
+    if metrics['price'] == 'N/A':
+        return False
+    
+    # Count how many data points we have (excluding N/A and None)
+    data_points = 0
+    required_fields = ['price', '52_week_high', '52_week_low', 'market_cap', 'pe_ratio']
+    
+    for field in required_fields:
+        if metrics.get(field) != 'N/A' and metrics.get(field) is not None:
+            data_points += 1
+    
+    # Consider complete if we have at least price + 2 other metrics
+    return data_points >= 3
+
 @st.cache_data(ttl=3600)
 def get_enhanced_metrics(ticker: str) -> Dict:
     """
@@ -177,7 +212,7 @@ def get_enhanced_metrics(ticker: str) -> Dict:
     1. Yahoo Finance (FREE - NO LIMITS)
     2. Finnhub (FREE - 60/min, has P/E)
     3. Alpha Vantage (LIMITED - 5/min)
-    4. Marketstack (PAID - save for backup only)
+    4. Marketstack (PAID - fallback for incomplete data)
     
     Args:
         ticker: Stock ticker symbol
@@ -207,7 +242,7 @@ def get_enhanced_metrics(ticker: str) -> Dict:
         
         # PRIMARY: Yahoo Finance (FREE - unlimited requests)
         try:
-            logger.info(f"Trying Yahoo Finance for {ticker}")
+            logger.info(f"[1/5] Trying Yahoo Finance for {ticker}")
             
             url = f"https://query1.finance.yahoo.com/v10/finance/quoteSummary/{ticker.upper()}?modules=price,financialData,defaultKeyStatistics,summaryDetail"
             headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
@@ -274,10 +309,12 @@ def get_enhanced_metrics(ticker: str) -> Dict:
                             except:
                                 pass
                     
-                    if metrics['price'] != 'N/A':
+                    if is_metrics_complete(metrics):
                         metrics['data_source'] = 'Yahoo Finance'
-                        logger.info(f"Yahoo Finance success for {ticker}")
+                        logger.info(f"✅ Yahoo Finance complete for {ticker}")
                         return metrics
+                    else:
+                        logger.info(f"⚠️ Yahoo Finance incomplete for {ticker}, trying next source")
         
         except Exception as yf_err:
             logger.debug(f"Yahoo Finance failed: {yf_err}")
@@ -285,7 +322,7 @@ def get_enhanced_metrics(ticker: str) -> Dict:
         # SECONDARY: Finnhub (FREE - 60 calls/min, has better P/E data)
         if FINNHUB_API_KEY:
             try:
-                logger.info(f"Trying Finnhub for {ticker}")
+                logger.info(f"[2/5] Trying Finnhub for {ticker}")
                 
                 quote_url = f"{FINNHUB_BASE_URL}/quote?symbol={ticker.upper()}&token={FINNHUB_API_KEY}"
                 quote_response = requests.get(quote_url, timeout=5)
@@ -305,10 +342,12 @@ def get_enhanced_metrics(ticker: str) -> Dict:
                         except:
                             pass
                     
-                    if metrics['price'] != 'N/A':
+                    if is_metrics_complete(metrics):
                         metrics['data_source'] = 'Finnhub'
-                        logger.info(f"Finnhub success for {ticker}")
+                        logger.info(f"✅ Finnhub complete for {ticker}")
                         return metrics
+                    else:
+                        logger.info(f"⚠️ Finnhub incomplete for {ticker}, trying next source")
             
             except Exception as fh_err:
                 logger.debug(f"Finnhub failed: {fh_err}")
@@ -316,7 +355,7 @@ def get_enhanced_metrics(ticker: str) -> Dict:
         # TERTIARY: Alpha Vantage (LIMITED - 5 calls/min, save for company info)
         if ALPHA_VANTAGE_API_KEY != "demo":
             try:
-                logger.info(f"Trying Alpha Vantage for {ticker}")
+                logger.info(f"[3/5] Trying Alpha Vantage for {ticker}")
                 
                 params = {
                     'function': 'GLOBAL_QUOTE',
@@ -336,18 +375,20 @@ def get_enhanced_metrics(ticker: str) -> Dict:
                     if quote.get('52WeekLow'):
                         metrics['52_week_low'] = round(float(quote.get('52WeekLow')), 2)
                     
-                    if metrics['price'] != 'N/A':
+                    if is_metrics_complete(metrics):
                         metrics['data_source'] = 'Alpha Vantage'
-                        logger.info(f"Alpha Vantage success for {ticker}")
+                        logger.info(f"✅ Alpha Vantage complete for {ticker}")
                         return metrics
+                    else:
+                        logger.info(f"⚠️ Alpha Vantage incomplete for {ticker}, trying Marketstack")
             
             except Exception as av_err:
                 logger.debug(f"Alpha Vantage failed: {av_err}")
         
-        # QUATERNARY: Marketstack (PAID - save for backup only)
-        if MARKETSTACK_API_KEY and metrics['price'] == 'N/A':
+        # QUATERNARY: Marketstack (PAID - use as fallback for incomplete data)
+        if MARKETSTACK_API_KEY:
             try:
-                logger.info(f"Trying Marketstack for {ticker} (using paid quota)")
+                logger.info(f"[4/5] Trying Marketstack for {ticker} (using paid quota)")
                 
                 url = f"{MARKETSTACK_BASE_URL}/eod"
                 params = {
@@ -369,15 +410,23 @@ def get_enhanced_metrics(ticker: str) -> Dict:
                     if result.get('low'):
                         metrics['52_week_low'] = round(float(result.get('low')), 2)
                     
-                    if metrics['price'] != 'N/A':
+                    if is_metrics_complete(metrics):
                         metrics['data_source'] = 'Marketstack'
-                        logger.info(f"Marketstack success for {ticker}")
+                        logger.info(f"✅ Marketstack complete for {ticker}")
                         return metrics
+                    else:
+                        logger.info(f"⚠️ Marketstack incomplete for {ticker}")
             
             except Exception as ms_err:
                 logger.debug(f"Marketstack failed: {ms_err}")
         
-        logger.error(f"All data sources failed for {ticker}")
+        # If we got this far, return what we have
+        if metrics['price'] != 'N/A':
+            # We at least have a price from somewhere
+            logger.warning(f"⚠️ Partial data for {ticker}: {metrics['data_source']}")
+            return metrics
+        
+        logger.error(f"❌ ALL sources failed for {ticker} - returning N/A")
         metrics['data_source'] = 'No Data Available'
         return metrics
     
@@ -1024,7 +1073,7 @@ def render_analytics_dashboard(articles: List[Dict], recommendations: List[Dict]
     st.markdown("---")
     
     st.markdown("### 💹 Company Financial Metrics")
-    st.markdown("*Data sources prioritized: Yahoo Finance (free) → Finnhub (free) → Alpha Vantage (limited) → Marketstack (paid backup only)*")
+    st.markdown("*Data sources prioritized: Yahoo Finance (free) → Finnhub (free) → Alpha Vantage (limited) → Marketstack (paid backup)*")
     
     if articles:
         mentions = extract_stock_mentions(articles)
@@ -1093,16 +1142,16 @@ def render_analytics_dashboard(articles: List[Dict], recommendations: List[Dict]
             - Get key: https://www.alphavantage.co/
             
             ⭐ **Marketstack (BACKUP ONLY - PAID)**
-            - Only used if all free sources fail
-            - Free tier: 100 requests/month (NOT recommended for daily use)
+            - Used as final fallback if all free sources return incomplete data
+            - Free tier: 100 requests/month (very limited)
+            - Paid tier: $99/month (not recommended)
             - Get key: https://marketstack.com/
             
             ✅ **FRED (MACRO - UNLIMITED)**
             - S&P 500 CAPE ratio for market-wide valuation
             - Get key: https://fred.stlouisfed.org/
             
-            **Recommendation:** Start with just Yahoo Finance + optional Finnhub. 
-            Add others only if needed. Yahoo Finance is the most reliable and unlimited!
+            **Recommendation:** Use Yahoo Finance as primary. Add others as needed.
             """)
         else:
             st.info("Financial metrics data not available. Check your network connection.")
@@ -1142,7 +1191,7 @@ def main():
     init_session()
     
     st.title("📈 Stock Recommendation Engine")
-    st.markdown("AI-powered daily stock recommendations | Optimized for free APIs (Yahoo Finance first, minimal paid API usage)")
+    st.markdown("AI-powered daily stock recommendations | Optimized for free APIs (Yahoo Finance first, Marketstack fallback for incomplete data)")
     
     with st.sidebar:
         st.header("⚙️ Controls")
@@ -1195,10 +1244,11 @@ def main():
             1. Crawls financial news from 7 major sources daily
             2. Analyzes coverage across all market cap categories
             3. Extracts stock & ETF mentions
-            4. Analyzes fundamentals using free APIs
+            4. Analyzes fundamentals using free APIs with Marketstack fallback
             5. Generates recommendations with source links
             
-            **API Strategy:** Minimizes paid API usage by prioritizing Yahoo Finance
+            **API Strategy:** Tries free sources first (Yahoo Finance, Finnhub, Alpha Vantage), 
+            then falls back to Marketstack only if data is incomplete.
             """)
         
         with st.expander("🔑 API Configuration"):
@@ -1213,20 +1263,20 @@ def main():
             
             with col2:
                 st.subheader("Financial Data")
-                st.success("✅ Yahoo Finance (FREE - always available)")
+                st.success("✅ Yahoo Finance (always available)")
                 if FINNHUB_API_KEY:
                     st.success("✅ Finnhub (backup)")
                 if ALPHA_VANTAGE_API_KEY != "demo":
                     st.success("✅ Alpha Vantage (company info)")
                 if MARKETSTACK_API_KEY:
-                    st.success("✅ Marketstack (emergency backup)")
+                    st.success("✅ Marketstack (final fallback)")
             
             st.divider()
             
             st.markdown("""
-            **API Priority (Left to Right = Used First):**
+            **API Priority (Left to Right = Tried First):**
             
-            1️⃣ **Yahoo Finance** (RECOMMENDED - START HERE)
+            1️⃣ **Yahoo Finance** (RECOMMENDED)
                - ✅ Unlimited requests, no key needed
                - ✅ Gets price, P/E, 52W, market cap, dividends
                - 💰 Cost: $0/month
@@ -1241,8 +1291,9 @@ def main():
                - Get key: https://www.alphavantage.co/api/
                - 💰 Cost: $0 (free tier)
             
-            4️⃣ **Marketstack** (BACKUP ONLY - AVOID)
-               - ⚠️ Limited to 100 requests/month (not recommended)
+            4️⃣ **Marketstack** (BACKUP ONLY - FINAL FALLBACK)
+               - ⚠️ Only used if all above sources fail or return incomplete data
+               - Free tier: 100 requests/month
                - Get key: https://marketstack.com/
                - 💰 Cost: $0 free or $99+/month paid
             
@@ -1253,8 +1304,8 @@ def main():
             
             **Recommended Setup:**
             - Just use Yahoo Finance (it has everything!)
-            - Add Finnhub only if Yahoo fails
-            - Skip Marketstack entirely - you don't need it!
+            - Add Finnhub ($0 free tier) as first backup
+            - Add Marketstack only if you need guaranteed complete data
             """)
     
     if st.session_state.last_crawl:
