@@ -165,8 +165,8 @@ def get_company_info(ticker: str) -> Dict:
 @st.cache_data(ttl=3600)
 def get_enhanced_metrics(ticker: str) -> Dict:
     """
-    Fetch comprehensive stock metrics using direct price history
-    This avoids the problematic .info endpoint and uses real price data instead
+    Fetch comprehensive stock metrics using Alpha Vantage and Yahoo Finance free APIs
+    This is much more reliable than yfinance on Streamlit Cloud
     
     Args:
         ticker: Stock ticker symbol
@@ -192,89 +192,118 @@ def get_enhanced_metrics(ticker: str) -> Dict:
     }
     
     try:
-        import yfinance as yf_local
+        logger.info(f"Fetching metrics for {ticker} using free APIs")
         
-        logger.info(f"Fetching metrics for {ticker} using direct price history")
-        
-        # Create ticker object
-        ticker_obj = yf_local.Ticker(ticker)
-        
-        # Get 1 year of historical data for 52-week highs/lows and volatility
-        try:
-            hist_1y = ticker_obj.history(period="1y", progress=False)
+        # Primary source: Alpha Vantage GLOBAL_QUOTE
+        if ALPHA_VANTAGE_API_KEY != "demo":
+            try:
+                params = {
+                    'function': 'GLOBAL_QUOTE',
+                    'symbol': ticker,
+                    'apikey': ALPHA_VANTAGE_API_KEY
+                }
+                response = requests.get('https://www.alphavantage.co/query', params=params, timeout=10)
+                data = response.json()
+                
+                if 'Global Quote' in data and data['Global Quote']:
+                    quote = data['Global Quote']
+                    
+                    # Price
+                    if quote.get('05. price'):
+                        try:
+                            metrics['price'] = round(float(quote.get('05. price')), 2)
+                            logger.info(f"{ticker} price: ${metrics['price']}")
+                        except:
+                            pass
+                    
+                    # 52-week high/low
+                    if quote.get('52WeekHigh'):
+                        try:
+                            metrics['52_week_high'] = round(float(quote.get('52WeekHigh')), 2)
+                        except:
+                            pass
+                    
+                    if quote.get('52WeekLow'):
+                        try:
+                            metrics['52_week_low'] = round(float(quote.get('52WeekLow')), 2)
+                        except:
+                            pass
+                    
+                    metrics['data_source'] = 'Alpha Vantage'
+                    logger.info(f"Alpha Vantage data for {ticker}: {metrics}")
+                    return metrics
             
-            if hist_1y is not None and not hist_1y.empty and len(hist_1y) > 0:
-                close_prices = hist_1y['Close']
-                
-                # Current price (last close)
-                current_price = close_prices.iloc[-1]
-                if current_price > 0:
-                    metrics['price'] = round(float(current_price), 2)
-                    logger.info(f"{ticker} current price: ${metrics['price']}")
-                
-                # 52-week high/low
-                metrics['52_week_high'] = round(float(close_prices.max()), 2)
-                metrics['52_week_low'] = round(float(close_prices.min()), 2)
-                logger.info(f"{ticker} 52W range: ${metrics['52_week_low']} - ${metrics['52_week_high']}")
-                
-                # Calculate volatility from last 90 days
-                try:
-                    hist_90d = hist_1y.tail(90)
-                    if len(hist_90d) > 1:
-                        returns = hist_90d['Close'].pct_change().dropna()
-                        if len(returns) > 0 and returns.std() > 0:
-                            volatility = returns.std() * np.sqrt(252)
-                            if 0 < volatility < 5:  # Sanity check
-                                metrics['volatility'] = round(volatility * 100, 2)
-                                logger.info(f"{ticker} volatility: {metrics['volatility']}%")
-                except Exception as vol_err:
-                    logger.debug(f"Volatility calculation failed: {vol_err}")
+            except Exception as av_err:
+                logger.warning(f"Alpha Vantage failed: {av_err}")
         
-        except Exception as hist_err:
-            logger.error(f"Error fetching history for {ticker}: {hist_err}")
-        
-        # Try to get quarterly data for additional metrics
+        # Fallback: Yahoo Finance via free API endpoint
         try:
-            quarterly_financials = ticker_obj.quarterly_financials
-            if quarterly_financials is not None and not quarterly_financials.empty:
-                logger.info(f"Got quarterly financials for {ticker}")
+            logger.info(f"Trying Yahoo Finance free endpoint for {ticker}")
+            url = f"https://query1.finance.yahoo.com/v10/finance/quoteSummary/{ticker}?modules=price,financialData,defaultKeyStatistics"
+            headers = {'User-Agent': 'Mozilla/5.0'}
+            response = requests.get(url, headers=headers, timeout=10)
+            
+            if response.status_code == 200:
+                data = response.json()
                 
-                # Get most recent quarter
-                most_recent_quarter = quarterly_financials.columns[0]
-                
-                # EPS calculation
-                try:
-                    net_income = quarterly_financials.loc['Net Income', most_recent_quarter]
-                    shares_outstanding = ticker_obj.info.get('sharesOutstanding', 0) if hasattr(ticker_obj, 'info') else 0
+                if 'quoteSummary' in data and 'result' in data['quoteSummary'] and len(data['quoteSummary']['result']) > 0:
+                    result = data['quoteSummary']['result'][0]
                     
-                    if net_income and shares_outstanding and shares_outstanding > 0:
-                        eps = net_income / shares_outstanding
-                        if eps != 0:
-                            metrics['eps'] = round(float(eps), 2)
-                            logger.info(f"{ticker} EPS: ${metrics['eps']}")
-                except Exception as eps_err:
-                    logger.debug(f"EPS calculation failed: {eps_err}")
-                
-                # Profit margin
-                try:
-                    net_income = quarterly_financials.loc['Net Income', most_recent_quarter]
-                    revenue = quarterly_financials.loc['Total Revenue', most_recent_quarter]
+                    # Price
+                    if 'price' in result and 'regularMarketPrice' in result['price']:
+                        try:
+                            price_val = result['price']['regularMarketPrice']['raw']
+                            metrics['price'] = round(float(price_val), 2)
+                            logger.info(f"{ticker} price from Yahoo: ${metrics['price']}")
+                        except Exception as p_err:
+                            logger.debug(f"Price extraction failed: {p_err}")
                     
-                    if net_income and revenue and revenue != 0:
-                        profit_margin = (net_income / revenue) * 100
-                        if -100 < profit_margin < 100:
-                            metrics['profit_margin'] = round(float(profit_margin), 2)
-                            logger.info(f"{ticker} profit margin: {metrics['profit_margin']}%")
-                except Exception as pm_err:
-                    logger.debug(f"Profit margin calculation failed: {pm_err}")
+                    # 52-week high/low
+                    if 'defaultKeyStatistics' in result:
+                        stats = result['defaultKeyStatistics']
+                        
+                        if 'fiftyTwoWeekHigh' in stats:
+                            try:
+                                metrics['52_week_high'] = round(float(stats['fiftyTwoWeekHigh']['raw']), 2)
+                            except:
+                                pass
+                        
+                        if 'fiftyTwoWeekLow' in stats:
+                            try:
+                                metrics['52_week_low'] = round(float(stats['fiftyTwoWeekLow']['raw']), 2)
+                            except:
+                                pass
+                    
+                    # P/E Ratio
+                    if 'financialData' in result and 'trailingPE' in result['financialData']:
+                        try:
+                            pe = result['financialData']['trailingPE']['raw']
+                            if pe and pe > 0:
+                                metrics['pe_ratio'] = round(float(pe), 2)
+                                logger.info(f"{ticker} P/E: {metrics['pe_ratio']}")
+                        except:
+                            pass
+                    
+                    # Dividend yield
+                    if 'financialData' in result and 'dividendYield' in result['financialData']:
+                        try:
+                            div = result['financialData']['dividendYield']['raw']
+                            if div and div > 0:
+                                metrics['dividend_yield'] = round(float(div) * 100, 2)
+                        except:
+                            pass
+                    
+                    metrics['data_source'] = 'Yahoo Finance (Free)'
+                    logger.info(f"Yahoo Finance data for {ticker}: {metrics}")
+                    return metrics
         
-        except Exception as fin_err:
-            logger.debug(f"Error fetching quarterly financials for {ticker}: {fin_err}")
+        except Exception as yf_err:
+            logger.warning(f"Yahoo Finance endpoint failed: {yf_err}")
         
-        # Try Finnhub as fallback for P/E ratio and other metrics
+        # Final fallback: Finnhub
         if FINNHUB_API_KEY:
             try:
-                logger.info(f"Trying Finnhub for additional metrics for {ticker}")
+                logger.info(f"Trying Finnhub for {ticker}")
                 finnhub_url = f"https://finnhub.io/api/v1/quote?symbol={ticker}&token={FINNHUB_API_KEY}"
                 response = requests.get(finnhub_url, timeout=5)
                 
@@ -282,37 +311,27 @@ def get_enhanced_metrics(ticker: str) -> Dict:
                     finnhub_data = response.json()
                     logger.info(f"Finnhub data for {ticker}: {finnhub_data}")
                     
-                    # P/E ratio
-                    if finnhub_data.get('pe') and finnhub_data.get('pe') > 0:
+                    if finnhub_data.get('c'):
+                        metrics['price'] = round(float(finnhub_data.get('c')), 2)
+                    if finnhub_data.get('pe'):
                         metrics['pe_ratio'] = round(float(finnhub_data.get('pe')), 2)
-                        logger.info(f"{ticker} P/E from Finnhub: {metrics['pe_ratio']}")
+                    if finnhub_data.get('h52'):
+                        metrics['52_week_high'] = round(float(finnhub_data.get('h52')), 2)
+                    if finnhub_data.get('l52'):
+                        metrics['52_week_low'] = round(float(finnhub_data.get('l52')), 2)
                     
-                    # Dividend yield
-                    if finnhub_data.get('d') and finnhub_data.get('d') > 0:
-                        metrics['dividend_yield'] = round(float(finnhub_data.get('d')), 2)
-                    
-                    metrics['data_source'] = 'yfinance + Finnhub'
+                    metrics['data_source'] = 'Finnhub'
+                    return metrics
             
             except Exception as fh_err:
-                logger.debug(f"Finnhub request failed: {fh_err}")
+                logger.warning(f"Finnhub failed: {fh_err}")
         
-        # Set final data source
-        if metrics['data_source'] == 'None':
-            if metrics['price'] != 'N/A':
-                metrics['data_source'] = 'yfinance (History)'
-            else:
-                metrics['data_source'] = 'No Data Available'
-        
-        logger.info(f"Final metrics for {ticker}: {metrics}")
-        return metrics
-    
-    except ImportError:
-        logger.error("yfinance not installed")
-        metrics['data_source'] = 'Error: yfinance not installed'
+        logger.error(f"All data sources failed for {ticker}")
+        metrics['data_source'] = 'No Data Available - All APIs failed'
         return metrics
     
     except Exception as e:
-        logger.error(f"Error in get_enhanced_metrics for {ticker}: {str(e)}")
+        logger.error(f"Unexpected error in get_enhanced_metrics for {ticker}: {str(e)}")
         metrics['data_source'] = f'Error: {str(e)}'
         return metrics
 
@@ -1025,7 +1044,7 @@ def render_analytics_dashboard(articles: List[Dict], recommendations: List[Dict]
     
     # Company Metrics Section
     st.markdown("### 💹 Company Financial Metrics")
-    st.markdown("*Most recent price, P/E ratio, volatility, and other key financial data*")
+    st.markdown("*Most recent price, P/E ratio, and other key financial data*")
     
     if articles:
         mentions = extract_stock_mentions(articles)
@@ -1051,7 +1070,8 @@ def render_analytics_dashboard(articles: List[Dict], recommendations: List[Dict]
                 '52W Low': metrics.get('52_week_low', 'N/A'),
                 'Dividend Yield (%)': metrics.get('dividend_yield', 'N/A'),
                 'EPS': metrics.get('eps', 'N/A'),
-                'Profit Margin (%)': metrics.get('profit_margin', 'N/A')
+                'Profit Margin (%)': metrics.get('profit_margin', 'N/A'),
+                'Data Source': metrics.get('data_source', 'N/A')
             })
             
             progress_bar.progress((idx + 1) / total_tickers)
@@ -1075,7 +1095,8 @@ def render_analytics_dashboard(articles: List[Dict], recommendations: List[Dict]
                     '52W Low': st.column_config.NumberColumn('52-Week Low', format='$%.2f'),
                     'Dividend Yield (%)': st.column_config.NumberColumn('Dividend Yield (%)', format='%.2f'),
                     'EPS': st.column_config.NumberColumn('EPS', format='$.2f'),
-                    'Profit Margin (%)': st.column_config.NumberColumn('Profit Margin (%)', format='%.2f')
+                    'Profit Margin (%)': st.column_config.NumberColumn('Profit Margin (%)', format='%.2f'),
+                    'Data Source': st.column_config.TextColumn('Data Source', width='small')
                 }
             )
             
@@ -1086,22 +1107,24 @@ def render_analytics_dashboard(articles: List[Dict], recommendations: List[Dict]
             
             st.markdown("""
             **Metric Definitions:**
-            - **Price**: Current stock price (last daily close)
+            - **Price**: Current stock price (latest market price)
             - **P/E Ratio**: Price-to-Earnings ratio (lower = potentially better value)
             - **CAPE Ratio**: Cyclically Adjusted P/E (compares to 10-year historical earnings)
-            - **Volatility (%)**: 90-day annualized return volatility (higher = more risk)
-            - **52W High/Low**: 52-week trading range (actual highs/lows from market data)
+            - **Volatility (%)**: Historical price volatility metric
+            - **52W High/Low**: 52-week trading range
             - **Dividend Yield (%)**: Annual dividend as percentage of stock price
-            - **EPS**: Earnings Per Share (calculated from quarterly financials)
+            - **EPS**: Earnings Per Share
             - **Profit Margin (%)**: Net profit as percentage of revenue
+            - **Data Source**: Which API provided the metrics (Alpha Vantage, Yahoo Finance, or Finnhub)
             
             **Data Sources:** 
-            - Primary: yfinance (Yahoo Finance - free historical price data)
-            - Secondary: Finnhub API (if configured - for P/E ratio)
-            - CAPE Ratio: FRED (Federal Reserve Economic Data - if configured)
+            - Alpha Vantage (primary if API key configured)
+            - Yahoo Finance free endpoint (fallback)
+            - Finnhub API (if configured - for P/E ratio)
+            - FRED (Federal Reserve Economic Data - if configured for CAPE ratio)
             """)
         else:
-            st.info("Financial metrics data not available. Check if yfinance is installed: `pip install yfinance`")
+            st.info("Financial metrics data not available. Please check your API configuration.")
     
     st.markdown("---")
     
@@ -1218,22 +1241,24 @@ def main():
             
             with col2:
                 st.subheader("Financial Data")
-                try:
-                    import yfinance
-                    st.success("✅ yfinance ready")
-                except ImportError:
-                    st.error("❌ yfinance not installed")
-                    st.code("pip install yfinance", language="bash")
+                if ALPHA_VANTAGE_API_KEY != "demo":
+                    st.success("✅ Alpha Vantage ready")
+                else:
+                    st.warning("⚠️ Will try Yahoo Finance")
             
             st.divider()
             
             st.markdown("""
             **API Status:**
             
-            ✅ **yfinance** (PRIMARY - NO KEY NEEDED)
-            - Get real price data, volatility, 52W ranges
-            - No API key required
-            - Install: `pip install yfinance`
+            ✅ **Alpha Vantage** (PRIMARY - FREE TIER)
+            - Get real stock prices and 52W ranges
+            - Get API key: https://www.alphavantage.co/api/
+            - Add to `.env`: `ALPHA_VANTAGE_API_KEY=...`
+            
+            ✅ **Yahoo Finance** (FALLBACK - NO KEY NEEDED)
+            - Automatic fallback if Alpha Vantage unavailable
+            - Free public endpoint
             
             ⭐ **Finnhub** (OPTIONAL - P/E RATIO)
             - Fallback data source for P/E ratio
