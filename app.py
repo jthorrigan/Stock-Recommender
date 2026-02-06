@@ -1,7 +1,7 @@
 """
 Stock Recommendation Web App - Streamlit Application
 Daily web crawler and AI-powered stock recommendations
-Optimized for Streamlit Cloud with batch requests and caching
+Using Financial Modelling Prep (FMP) as primary and EODHD as fallback
 """
 
 import streamlit as st
@@ -17,13 +17,6 @@ import xml.etree.ElementTree as ET
 import re
 import numpy as np
 import time
-
-# Try to import yfinance for best free data
-try:
-    import yfinance as yf
-    YFINANCE_AVAILABLE = True
-except ImportError:
-    YFINANCE_AVAILABLE = False
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -55,20 +48,20 @@ SEC_FILINGS_API = "https://www.sec.gov/cgi-bin/browse-edgar"
 
 # Try to load from Streamlit secrets first, fallback to environment variables
 try:
-    FINNHUB_API_KEY = st.secrets.get("finnhub_api_key", "")
-    ALPHA_VANTAGE_API_KEY = st.secrets.get("alpha_vantage_api_key", "demo")
+    FMP_API_KEY = st.secrets.get("fmp_api_key", "")
+    EODHD_API_KEY = st.secrets.get("eodhd_api_key", "")
     HF_API_KEY = st.secrets.get("hf_api_key", "")
     FRED_API_KEY = st.secrets.get("fred_api_key", "")
 except:
     # Fallback to environment variables
-    FINNHUB_API_KEY = os.getenv("FINNHUB_API_KEY", "")
-    ALPHA_VANTAGE_API_KEY = os.getenv("ALPHA_VANTAGE_API_KEY", "demo")
+    FMP_API_KEY = os.getenv("FMP_API_KEY", "")
+    EODHD_API_KEY = os.getenv("EODHD_API_KEY", "")
     HF_API_KEY = os.getenv("HF_API_KEY", "")
     FRED_API_KEY = os.getenv("FRED_API_KEY", "")
 
-# API base URLs
-FINNHUB_BASE_URL = "https://finnhub.io/api/v1"
-ALPHA_VANTAGE_BASE_URL = "https://www.alphavantage.co/query"
+# API endpoints
+FMP_BASE_URL = "https://financialmodelingprep.com/api/v3"
+EODHD_BASE_URL = "https://eodhd.com/api"
 
 # Expanded ticker list - Large-cap, Mid-cap, Small-cap, and ETFs
 STOCK_TICKERS = {
@@ -111,18 +104,9 @@ def clear_cache():
 # RETRY LOGIC WITH EXPONENTIAL BACKOFF
 # ============================================================================
 
-def retry_with_backoff(func, max_retries=3, backoff_factor=2, timeout=10):
+def retry_with_backoff(func, max_retries=3, backoff_factor=2):
     """
     Retry a function with exponential backoff
-    
-    Args:
-        func: Function to retry
-        max_retries: Maximum number of retries
-        backoff_factor: Exponential backoff factor
-        timeout: Request timeout in seconds
-    
-    Returns:
-        Result from function or None if all retries fail
     """
     for attempt in range(max_retries):
         try:
@@ -137,282 +121,371 @@ def retry_with_backoff(func, max_retries=3, backoff_factor=2, timeout=10):
                 return None
 
 # ============================================================================
-# BATCH YFINANCE REQUESTS (MOST IMPORTANT FIX)
+# FINANCIAL MODELLING PREP (FMP) API FUNCTIONS
 # ============================================================================
 
 @st.cache_data(ttl=3600)
-def get_batch_metrics(tickers: List[str]) -> Dict[str, Dict]:
+def get_fmp_quote(ticker: str) -> Dict:
     """
-    Fetch metrics for multiple tickers in batch (more efficient)
-    This is KEY to avoiding rate limits
-    
-    Args:
-        tickers: List of stock ticker symbols
-    
-    Returns:
-        Dictionary mapping ticker to metrics
+    Fetch stock quote from Financial Modelling Prep
+    Returns: price, PE ratio, market cap, etc.
     """
-    
-    batch_metrics = {}
-    
-    if not YFINANCE_AVAILABLE:
-        return batch_metrics
-    
-    logger.info(f"Fetching batch metrics for {len(tickers)} tickers")
+    if not FMP_API_KEY:
+        logger.warning("FMP_API_KEY not configured")
+        return {}
     
     try:
-        # BATCH REQUEST - Most important for rate limiting!
-        logger.info(f"[BATCH] Downloading data for: {', '.join(tickers)}")
+        logger.info(f"[FMP] Fetching quote for {ticker}")
         
-        def download_batch():
-            return yf.download(
-                tickers=tickers,
-                period="1y",
-                progress=False,
-                group_by="ticker",
-                threads=False  # IMPORTANT: Single-threaded to avoid rate limits
-            )
+        def fetch():
+            url = f"{FMP_BASE_URL}/quote/{ticker}"
+            params = {'apikey': FMP_API_KEY}
+            response = requests.get(url, params=params, timeout=10)
+            response.raise_for_status()
+            data = response.json()
+            return data[0] if isinstance(data, list) and len(data) > 0 else data
         
-        # Use retry logic
-        data = retry_with_backoff(download_batch, max_retries=3, backoff_factor=2)
+        data = retry_with_backoff(fetch, max_retries=2)
         
-        if data is None or data.empty:
-            logger.warning("Batch download returned empty data")
-            return batch_metrics
-        
-        logger.info(f"✅ Batch download successful for {len(tickers)} tickers")
-        
-        # Process each ticker
-        for ticker in tickers:
-            try:
-                metrics = {
-                    'ticker': ticker,
-                    'pe_ratio': 'N/A',
-                    'price': 'N/A',
-                    '52_week_high': 'N/A',
-                    '52_week_low': 'N/A',
-                    'market_cap': 'N/A',
-                    'dividend_yield': 'N/A',
-                    'eps': 'N/A',
-                    'data_source': 'yfinance (Batch)'
-                }
-                
-                # Extract ticker data
-                if len(tickers) == 1:
-                    ticker_data = data
-                else:
-                    ticker_data = data[ticker] if ticker in data.columns.get_level_values(0) else data[ticker]
-                
-                if ticker_data.empty:
-                    logger.warning(f"No data for {ticker}")
-                    batch_metrics[ticker] = metrics
-                    continue
-                
-                # Current price
-                try:
-                    latest_close = ticker_data['Close'].iloc[-1]
-                    if pd.notna(latest_close):
-                        metrics['price'] = round(float(latest_close), 2)
-                        logger.info(f"{ticker} price: ${metrics['price']}")
-                except Exception as e:
-                    logger.debug(f"Price extraction failed for {ticker}: {e}")
-                
-                # 52-week high/low
-                try:
-                    metrics['52_week_high'] = round(float(ticker_data['High'].max()), 2)
-                    metrics['52_week_low'] = round(float(ticker_data['Low'].min()), 2)
-                except Exception as e:
-                    logger.debug(f"52W extraction failed for {ticker}: {e}")
-                
-                # Try to get info for P/E, market cap, etc.
-                try:
-                    time.sleep(0.5)  # Small delay between individual ticker info requests
-                    ticker_obj = yf.Ticker(ticker)
-                    info = ticker_obj.info
-                    
-                    if info:
-                        # Market cap
-                        if 'marketCap' in info and info['marketCap']:
-                            market_cap = info['marketCap']
-                            if market_cap >= 1e9:
-                                metrics['market_cap'] = f"${market_cap/1e9:.1f}B"
-                            elif market_cap >= 1e6:
-                                metrics['market_cap'] = f"${market_cap/1e6:.1f}M"
-                        
-                        # P/E Ratio
-                        if 'trailingPE' in info and info['trailingPE']:
-                            metrics['pe_ratio'] = round(float(info['trailingPE']), 2)
-                        
-                        # Dividend yield
-                        if 'trailingAnnualDividendYield' in info and info['trailingAnnualDividendYield']:
-                            metrics['dividend_yield'] = round(float(info['trailingAnnualDividendYield']) * 100, 2)
-                        
-                        # EPS
-                        if 'trailingEps' in info and info['trailingEps']:
-                            metrics['eps'] = round(float(info['trailingEps']), 2)
-                
-                except Exception as info_err:
-                    logger.debug(f"Info extraction failed for {ticker}: {info_err}")
-                
-                batch_metrics[ticker] = metrics
-                logger.info(f"✅ Metrics for {ticker}: Price=${metrics['price']}, 52W=${metrics['52_week_low']}-${metrics['52_week_high']}")
-            
-            except Exception as ticker_err:
-                logger.error(f"Error processing {ticker}: {str(ticker_err)}")
-                batch_metrics[ticker] = metrics
-        
-        return batch_metrics
+        if data:
+            logger.info(f"✅ FMP quote for {ticker}: ${data.get('price')}")
+            return data
+        return {}
     
     except Exception as e:
-        logger.error(f"Batch request failed: {str(e)}", exc_info=True)
-        return batch_metrics
-
-# ============================================================================
-# COMPANY DATA FUNCTIONS
-# ============================================================================
+        logger.debug(f"FMP quote failed for {ticker}: {e}")
+        return {}
 
 @st.cache_data(ttl=86400)
-def get_company_info(ticker: str) -> Dict:
+def get_fmp_profile(ticker: str) -> Dict:
     """
-    Fetch company information using yfinance
-    
-    Args:
-        ticker: Stock ticker symbol
-    
-    Returns:
-        Dictionary with company info
+    Fetch company profile from Financial Modelling Prep
+    Returns: company name, sector, industry, market cap
     """
+    if not FMP_API_KEY:
+        return {}
+    
     try:
-        if not YFINANCE_AVAILABLE:
-            return _get_company_info_fallback(ticker)
+        logger.info(f"[FMP] Fetching profile for {ticker}")
         
-        logger.info(f"Fetching company info from yfinance for {ticker}")
+        def fetch():
+            url = f"{FMP_BASE_URL}/profile/{ticker}"
+            params = {'apikey': FMP_API_KEY}
+            response = requests.get(url, params=params, timeout=10)
+            response.raise_for_status()
+            data = response.json()
+            return data[0] if isinstance(data, list) and len(data) > 0 else data
         
-        def get_info():
-            ticker_obj = yf.Ticker(ticker)
-            return ticker_obj.info
+        data = retry_with_backoff(fetch, max_retries=2)
         
-        info = retry_with_backoff(get_info, max_retries=2)
-        
-        if not info or 'longName' not in info:
-            return _get_company_info_fallback(ticker)
-        
-        market_cap = info.get('marketCap', 0)
-        market_cap_str = 'Unknown'
-        if market_cap and market_cap > 0:
-            if market_cap >= 1e9:
-                market_cap_str = f"${market_cap/1e9:.1f}B"
-            elif market_cap >= 1e6:
-                market_cap_str = f"${market_cap/1e6:.1f}M"
-        
-        return {
-            'ticker': ticker,
-            'name': info.get('longName', ticker),
-            'sector': info.get('sector', 'Unknown'),
-            'industry': info.get('industry', 'Unknown'),
-            'description': info.get('longBusinessSummary', ''),
-            'market_cap': market_cap_str,
-            'market_cap_numeric': market_cap if market_cap else 0,
-            'category': TICKER_CATEGORIES.get(ticker, 'Unknown'),
-            'pe_ratio': 'N/A',
-            'profit_margin': 'N/A',
-            'eps': 'N/A',
-            'data_source': 'yfinance'
-        }
+        if data:
+            logger.info(f"✅ FMP profile for {ticker}")
+            return data
+        return {}
     
     except Exception as e:
-        logger.warning(f"Error fetching company info for {ticker}: {str(e)}")
-        return _get_company_info_fallback(ticker)
-
-def _get_company_info_fallback(ticker: str) -> Dict:
-    """Fallback company info when yfinance fails"""
-    return {
-        'ticker': ticker,
-        'name': ticker,
-        'sector': 'Unknown',
-        'industry': 'Unknown',
-        'market_cap': 'Unknown',
-        'market_cap_numeric': 0,
-        'category': TICKER_CATEGORIES.get(ticker, 'Unknown'),
-        'pe_ratio': 'N/A',
-        'profit_margin': 'N/A',
-        'eps': 'N/A',
-        'data_source': 'Cache'
-    }
+        logger.debug(f"FMP profile failed for {ticker}: {e}")
+        return {}
 
 # ============================================================================
-# ENHANCED METRICS USING BATCH APPROACH
+# EODHD API FUNCTIONS (FALLBACK)
+# ============================================================================
+
+@st.cache_data(ttl=3600)
+def get_eodhd_quote(ticker: str) -> Dict:
+    """
+    Fetch real-time quote from EODHD
+    """
+    if not EODHD_API_KEY:
+        logger.warning("EODHD_API_KEY not configured")
+        return {}
+    
+    try:
+        logger.info(f"[EODHD] Fetching quote for {ticker}")
+        
+        def fetch():
+            url = f"{EODHD_BASE_URL}/real-time/{ticker}.US"
+            params = {'api_token': EODHD_API_KEY, 'fmt': 'json'}
+            response = requests.get(url, params=params, timeout=10)
+            response.raise_for_status()
+            return response.json()
+        
+        data = retry_with_backoff(fetch, max_retries=2)
+        
+        if data and data.get('close'):
+            logger.info(f"✅ EODHD quote for {ticker}: ${data.get('close')}")
+            return data
+        return {}
+    
+    except Exception as e:
+        logger.debug(f"EODHD quote failed for {ticker}: {e}")
+        return {}
+
+@st.cache_data(ttl=86400)
+def get_eodhd_fundamentals(ticker: str) -> Dict:
+    """
+    Fetch fundamental data from EODHD
+    Returns: market cap, dividend yield, PE ratio, etc.
+    """
+    if not EODHD_API_KEY:
+        return {}
+    
+    try:
+        logger.info(f"[EODHD] Fetching fundamentals for {ticker}")
+        
+        def fetch():
+            url = f"{EODHD_BASE_URL}/fundamentals/{ticker}.US"
+            params = {'api_token': EODHD_API_KEY}
+            response = requests.get(url, params=params, timeout=10)
+            response.raise_for_status()
+            return response.json()
+        
+        data = retry_with_backoff(fetch, max_retries=2)
+        
+        if data:
+            logger.info(f"✅ EODHD fundamentals for {ticker}")
+            return data
+        return {}
+    
+    except Exception as e:
+        logger.debug(f"EODHD fundamentals failed for {ticker}: {e}")
+        return {}
+
+# ============================================================================
+# UNIFIED METRICS FUNCTION
 # ============================================================================
 
 @st.cache_data(ttl=3600)
 def get_enhanced_metrics(ticker: str) -> Dict:
     """
-    Fetch stock metrics - uses batch approach or fallbacks
-    
-    Args:
-        ticker: Stock ticker symbol
-    
-    Returns:
-        Dictionary with stock metrics
+    Fetch stock metrics - PRIORITY ORDER:
+    1. FMP (PRIMARY) - Best free tier
+    2. EODHD (FALLBACK) - Reliable alternative
     """
     
-    # Try to get from batch cache first
-    batch_result = get_batch_metrics([ticker])
-    
-    if ticker in batch_result and batch_result[ticker]['price'] != 'N/A':
-        return batch_result[ticker]
-    
-    # Fallback to Finnhub
-    if FINNHUB_API_KEY:
-        try:
-            logger.info(f"Fallback to Finnhub for {ticker}")
-            time.sleep(0.5)  # Avoid rate limits
-            
-            quote_url = f"{FINNHUB_BASE_URL}/quote?symbol={ticker.upper()}&token={FINNHUB_API_KEY}"
-            quote_response = requests.get(quote_url, timeout=5)
-            
-            if quote_response.status_code == 200:
-                quote_data = quote_response.json()
-                
-                metrics = {
-                    'ticker': ticker,
-                    'price': round(float(quote_data.get('c')), 2) if quote_data.get('c') else 'N/A',
-                    '52_week_high': round(float(quote_data.get('h52')), 2) if quote_data.get('h52') else 'N/A',
-                    '52_week_low': round(float(quote_data.get('l52')), 2) if quote_data.get('l52') else 'N/A',
-                    'pe_ratio': round(float(quote_data.get('pe')), 2) if quote_data.get('pe') else 'N/A',
-                    'market_cap': 'N/A',
-                    'dividend_yield': 'N/A',
-                    'eps': 'N/A',
-                    'data_source': 'Finnhub'
-                }
-                
-                if metrics['price'] != 'N/A':
-                    logger.info(f"✅ Finnhub for {ticker}: ${metrics['price']}")
-                    return metrics
-        
-        except Exception as e:
-            logger.debug(f"Finnhub failed for {ticker}: {e}")
-    
-    # Return empty if all fail
-    return {
+    metrics = {
         'ticker': ticker,
+        'pe_ratio': 'N/A',
         'price': 'N/A',
         '52_week_high': 'N/A',
         '52_week_low': 'N/A',
-        'pe_ratio': 'N/A',
         'market_cap': 'N/A',
         'dividend_yield': 'N/A',
         'eps': 'N/A',
-        'data_source': 'No Data Available'
+        'data_source': 'None'
     }
+    
+    try:
+        # PRIMARY: Financial Modelling Prep
+        if FMP_API_KEY:
+            try:
+                logger.info(f"[1/2] Trying FMP for {ticker}")
+                time.sleep(0.2)  # Small delay to avoid rate limits
+                
+                fmp_quote = get_fmp_quote(ticker)
+                fmp_profile = get_fmp_profile(ticker)
+                
+                if fmp_quote:
+                    # Price
+                    if fmp_quote.get('price'):
+                        metrics['price'] = round(float(fmp_quote.get('price')), 2)
+                        logger.info(f"{ticker} price: ${metrics['price']}")
+                    
+                    # P/E Ratio
+                    if fmp_quote.get('pe'):
+                        try:
+                            pe = float(fmp_quote.get('pe'))
+                            if pe and pe > 0:
+                                metrics['pe_ratio'] = round(pe, 2)
+                        except:
+                            pass
+                    
+                    # 52-week high/low
+                    if fmp_quote.get('yearHigh'):
+                        metrics['52_week_high'] = round(float(fmp_quote.get('yearHigh')), 2)
+                    
+                    if fmp_quote.get('yearLow'):
+                        metrics['52_week_low'] = round(float(fmp_quote.get('yearLow')), 2)
+                
+                if fmp_profile:
+                    # Market cap
+                    if fmp_profile.get('mktCap'):
+                        market_cap = fmp_profile.get('mktCap')
+                        if market_cap >= 1e9:
+                            metrics['market_cap'] = f"${market_cap/1e9:.1f}B"
+                        elif market_cap >= 1e6:
+                            metrics['market_cap'] = f"${market_cap/1e6:.1f}M"
+                    
+                    # Dividend yield
+                    if fmp_profile.get('dcfValue'):
+                        try:
+                            metrics['eps'] = round(float(fmp_profile.get('dcfValue')), 2)
+                        except:
+                            pass
+                
+                if metrics['price'] != 'N/A':
+                    metrics['data_source'] = 'FMP'
+                    logger.info(f"✅ FMP complete for {ticker}")
+                    return metrics
+            
+            except Exception as fmp_err:
+                logger.debug(f"FMP failed: {fmp_err}")
+        
+        # FALLBACK: EODHD
+        if EODHD_API_KEY:
+            try:
+                logger.info(f"[2/2] Trying EODHD for {ticker}")
+                time.sleep(0.2)
+                
+                eodhd_quote = get_eodhd_quote(ticker)
+                eodhd_fund = get_eodhd_fundamentals(ticker)
+                
+                if eodhd_quote:
+                    # Price
+                    if eodhd_quote.get('close'):
+                        metrics['price'] = round(float(eodhd_quote.get('close')), 2)
+                        logger.info(f"{ticker} price from EODHD: ${metrics['price']}")
+                    
+                    # 52-week high/low (from fundamental data)
+                    if eodhd_fund:
+                        if eodhd_fund.get('General', {}).get('52WeekHigh'):
+                            metrics['52_week_high'] = round(float(eodhd_fund['General']['52WeekHigh']), 2)
+                        
+                        if eodhd_fund.get('General', {}).get('52WeekLow'):
+                            metrics['52_week_low'] = round(float(eodhd_fund['General']['52WeekLow']), 2)
+                        
+                        # Market cap
+                        if eodhd_fund.get('General', {}).get('MarketCapitalization'):
+                            market_cap = eodhd_fund['General']['MarketCapitalization']
+                            if market_cap >= 1e9:
+                                metrics['market_cap'] = f"${market_cap/1e9:.1f}B"
+                            elif market_cap >= 1e6:
+                                metrics['market_cap'] = f"${market_cap/1e6:.1f}M"
+                        
+                        # Dividend yield
+                        if eodhd_fund.get('Highlights', {}).get('DividendYield'):
+                            try:
+                                div = float(eodhd_fund['Highlights']['DividendYield'])
+                                metrics['dividend_yield'] = round(div * 100, 2)
+                            except:
+                                pass
+                        
+                        # PE ratio
+                        if eodhd_fund.get('Highlights', {}).get('PERatio'):
+                            try:
+                                metrics['pe_ratio'] = round(float(eodhd_fund['Highlights']['PERatio']), 2)
+                            except:
+                                pass
+                
+                if metrics['price'] != 'N/A':
+                    metrics['data_source'] = 'EODHD'
+                    logger.info(f"✅ EODHD complete for {ticker}")
+                    return metrics
+            
+            except Exception as eodhd_err:
+                logger.debug(f"EODHD failed: {eodhd_err}")
+        
+        logger.error(f"❌ ALL sources failed for {ticker}")
+        metrics['data_source'] = 'No Data Available'
+        return metrics
+    
+    except Exception as e:
+        logger.error(f"Unexpected error for {ticker}: {str(e)}", exc_info=True)
+        metrics['data_source'] = f'Error: {str(e)}'
+        return metrics
+
+@st.cache_data(ttl=86400)
+def get_company_info(ticker: str) -> Dict:
+    """
+    Fetch company information - uses FMP first, then EODHD
+    """
+    try:
+        logger.info(f"Fetching company info for {ticker}")
+        
+        # Try FMP first
+        if FMP_API_KEY:
+            try:
+                fmp_profile = get_fmp_profile(ticker)
+                if fmp_profile and fmp_profile.get('companyName'):
+                    market_cap = fmp_profile.get('mktCap', 0)
+                    market_cap_str = 'Unknown'
+                    if market_cap and market_cap > 0:
+                        if market_cap >= 1e9:
+                            market_cap_str = f"${market_cap/1e9:.1f}B"
+                        elif market_cap >= 1e6:
+                            market_cap_str = f"${market_cap/1e6:.1f}M"
+                    
+                    return {
+                        'ticker': ticker,
+                        'name': fmp_profile.get('companyName', ticker),
+                        'sector': fmp_profile.get('sector', 'Unknown'),
+                        'industry': fmp_profile.get('industry', 'Unknown'),
+                        'description': fmp_profile.get('description', ''),
+                        'market_cap': market_cap_str,
+                        'market_cap_numeric': market_cap,
+                        'category': TICKER_CATEGORIES.get(ticker, 'Unknown'),
+                        'data_source': 'FMP'
+                    }
+            except Exception as e:
+                logger.debug(f"FMP company info failed: {e}")
+        
+        # Fallback to EODHD
+        if EODHD_API_KEY:
+            try:
+                eodhd_fund = get_eodhd_fundamentals(ticker)
+                if eodhd_fund and eodhd_fund.get('General'):
+                    general = eodhd_fund['General']
+                    market_cap = general.get('MarketCapitalization', 0)
+                    market_cap_str = 'Unknown'
+                    if market_cap and market_cap > 0:
+                        if market_cap >= 1e9:
+                            market_cap_str = f"${market_cap/1e9:.1f}B"
+                        elif market_cap >= 1e6:
+                            market_cap_str = f"${market_cap/1e6:.1f}M"
+                    
+                    return {
+                        'ticker': ticker,
+                        'name': general.get('Name', ticker),
+                        'sector': general.get('Sector', 'Unknown'),
+                        'industry': general.get('Industry', 'Unknown'),
+                        'description': '',
+                        'market_cap': market_cap_str,
+                        'market_cap_numeric': market_cap,
+                        'category': TICKER_CATEGORIES.get(ticker, 'Unknown'),
+                        'data_source': 'EODHD'
+                    }
+            except Exception as e:
+                logger.debug(f"EODHD company info failed: {e}")
+        
+        # Fallback
+        return {
+            'ticker': ticker,
+            'name': ticker,
+            'sector': 'Unknown',
+            'industry': 'Unknown',
+            'market_cap': 'Unknown',
+            'market_cap_numeric': 0,
+            'category': TICKER_CATEGORIES.get(ticker, 'Unknown'),
+            'data_source': 'Cache'
+        }
+    
+    except Exception as e:
+        logger.warning(f"Error fetching company info for {ticker}: {str(e)}")
+        return {
+            'ticker': ticker,
+            'name': ticker,
+            'sector': 'Unknown',
+            'industry': 'Unknown',
+            'market_cap': 'Unknown',
+            'market_cap_numeric': 0,
+            'category': TICKER_CATEGORIES.get(ticker, 'Unknown'),
+            'data_source': 'Error'
+        }
 
 @st.cache_data(ttl=86400)
 def get_cape_ratio_approximation() -> Dict:
     """
     Fetch CAPE ratio from FRED API (Shiller P/E)
-    
-    Returns:
-        Dictionary with CAPE ratio data
     """
     
     cape_data = {
@@ -449,9 +522,6 @@ def get_cape_ratio_approximation() -> Dict:
 def crawl_news_feeds() -> List[Dict]:
     """
     Crawl RSS feeds from major financial news sources
-    
-    Returns:
-        List of article dictionaries with metadata
     """
     articles = []
     
@@ -528,12 +598,6 @@ def crawl_news_feeds() -> List[Dict]:
 def crawl_sec_filings(company_tickers: List[str]) -> List[Dict]:
     """
     Crawl SEC filings for specific companies
-    
-    Args:
-        company_tickers: List of stock tickers to research
-    
-    Returns:
-        List of SEC filing metadata
     """
     filings = []
     
@@ -570,12 +634,6 @@ def crawl_sec_filings(company_tickers: List[str]) -> List[Dict]:
 def extract_stock_mentions(articles: List[Dict]) -> Dict[str, List]:
     """
     Extract stock tickers from crawled articles
-    
-    Args:
-        articles: List of crawled articles
-    
-    Returns:
-        Dictionary mapping tickers to related articles
     """
     stock_mentions = {}
     
@@ -595,26 +653,20 @@ def extract_stock_mentions(articles: List[Dict]) -> Dict[str, List]:
 
 def get_stock_fundamentals(ticker: str) -> Dict:
     """
-    Fetch stock fundamentals - uses yfinance
-    
-    Args:
-        ticker: Stock ticker symbol
-    
-    Returns:
-        Dictionary with stock data
+    Fetch stock fundamentals - uses FMP or EODHD
     """
     try:
-        if not YFINANCE_AVAILABLE:
-            return {}
+        if FMP_API_KEY:
+            fmp_profile = get_fmp_profile(ticker)
+            if fmp_profile:
+                return fmp_profile
         
-        logger.info(f"Fetching fundamentals from yfinance for {ticker}")
+        if EODHD_API_KEY:
+            eodhd_fund = get_eodhd_fundamentals(ticker)
+            if eodhd_fund:
+                return eodhd_fund
         
-        def get_info():
-            ticker_obj = yf.Ticker(ticker)
-            return ticker_obj.info
-        
-        info = retry_with_backoff(get_info, max_retries=2)
-        return info if info else {}
+        return {}
     
     except Exception as e:
         logger.debug(f"Error fetching fundamentals for {ticker}: {str(e)}")
@@ -623,15 +675,6 @@ def get_stock_fundamentals(ticker: str) -> Dict:
 def calculate_confidence_score(ticker: str, articles: List[Dict], fundamentals: Dict, category: str) -> Tuple[float, str]:
     """
     Calculate confidence score and justification
-    
-    Args:
-        ticker: Stock ticker
-        articles: Related articles
-        fundamentals: Stock fundamentals
-        category: Stock category
-    
-    Returns:
-        Tuple of (confidence_score, justification_text)
     """
     
     confidence = 0.5
@@ -677,15 +720,6 @@ def generate_explanation_with_free_ai(
 ) -> str:
     """
     Generate investment explanation using Hugging Face
-    
-    Args:
-        ticker: Stock ticker
-        company_name: Company name
-        articles: Related articles
-        fundamentals: Stock fundamentals
-    
-    Returns:
-        500-word explanation
     """
     
     try:
@@ -743,18 +777,9 @@ def generate_template_explanation(
 ) -> str:
     """
     Generate template-based explanation
-    
-    Args:
-        ticker: Stock ticker
-        company_name: Company name
-        articles: Related articles
-        fundamentals: Stock fundamentals
-    
-    Returns:
-        500-word explanation
     """
     
-    sector = fundamentals.get('sector', 'the technology sector')
+    sector = fundamentals.get('sector') or fundamentals.get('Sector', 'the technology sector')
     recent_news = articles[0]['title'] if articles else "Recent market developments"
     
     explanation = f"""
@@ -785,18 +810,6 @@ Current valuation levels present an attractive risk-reward opportunity for sever
 
 3. **Timing**: Market cycles suggest we are in an advantageous entry window with accelerating growth rates indicated in forward estimates.
 
-### Technical and Macro Positioning
-
-From a macro perspective, several tailwinds support {company_name}'s investment case:
-
-- Industry growth rates are accelerating, creating favorable backdrop for outperformance
-- Regulatory environment remains supportive of the core business model
-- Economic indicators suggest sustained demand for products and services
-
-### Risk Considerations
-
-Investors should monitor quarterly revenue growth rates, margin trends, and competitive positioning. The company faces typical sector cyclical risks and competitive pressures.
-
 ### Conclusion
 
 {company_name} offers an attractive risk-reward profile for 12-24 month investors. The combination of favorable catalysts, improving fundamentals, and attractive valuation creates a compelling opportunity.
@@ -813,14 +826,6 @@ def generate_recommendation(
 ) -> Dict:
     """
     Generate recommendation with explanation and source links
-    
-    Args:
-        ticker: Stock ticker
-        articles: Related articles from crawl
-        fundamentals: Stock fundamental data
-    
-    Returns:
-        Recommendation dictionary with explanation and sources
     """
     
     company_info = get_company_info(ticker)
@@ -867,13 +872,6 @@ def generate_recommendations(
 ) -> List[Dict]:
     """
     Generate top N stock recommendations
-    
-    Args:
-        crawled_articles: Articles from web crawl
-        num_recommendations: Number of recommendations to generate
-    
-    Returns:
-        List of recommendation dictionaries
     """
     
     stock_mentions = extract_stock_mentions(crawled_articles)
@@ -883,11 +881,6 @@ def generate_recommendations(
         key=lambda x: len(x[1]),
         reverse=True
     )[:num_recommendations]
-    
-    # BATCH FETCH - This is the key optimization!
-    top_ticker_list = [ticker for ticker, _ in top_tickers]
-    logger.info(f"Batch fetching metrics for top {len(top_ticker_list)} tickers: {top_ticker_list}")
-    batch_data = get_batch_metrics(top_ticker_list)
     
     recommendations = []
     for ticker, articles in top_tickers:
@@ -1026,7 +1019,7 @@ def render_analytics_dashboard(articles: List[Dict], recommendations: List[Dict]
     st.markdown("---")
     
     st.markdown("### 💹 Company Financial Metrics")
-    st.markdown("*Data from yfinance with exponential backoff retry logic*")
+    st.markdown("*Data from FMP (primary) or EODHD (fallback)*")
     
     if articles:
         mentions = extract_stock_mentions(articles)
@@ -1074,6 +1067,24 @@ def render_analytics_dashboard(articles: List[Dict], recommendations: List[Dict]
             cape_info = get_cape_ratio_approximation()
             if cape_info['cape_ratio'] != 'N/A':
                 st.info(f"📊 **S&P 500 CAPE Ratio (Shiller P/E):** {cape_info['cape_ratio']} (as of {cape_info['cape_date']})")
+            
+            st.markdown("""
+            **Data Source Priority:**
+            
+            ✅ **FMP (Financial Modelling Prep)** - PRIMARY
+            - Free tier: 250 requests/day
+            - Real-time quotes, fundamentals, profiles
+            - Get key: https://site.financialmodelingprep.com/
+            
+            ✅ **EODHD** - FALLBACK
+            - End-of-day data with fundamentals
+            - Market cap, dividend yield, PE ratio
+            - Get key: https://eodhd.com/
+            
+            ✅ **FRED** - MACRO DATA
+            - S&P 500 CAPE ratio
+            - Get key: https://fred.stlouisfed.org/
+            """)
 
 def main():
     """Main Streamlit application"""
@@ -1081,11 +1092,7 @@ def main():
     init_session()
     
     st.title("📈 Stock Recommendation Engine")
-    st.markdown("AI-powered daily stock recommendations | Optimized for Streamlit Cloud with batch requests")
-    
-    if not YFINANCE_AVAILABLE:
-        st.error("❌ yfinance not installed! Run: `pip install yfinance`")
-        return
+    st.markdown("AI-powered daily stock recommendations | Using FMP & EODHD APIs")
     
     with st.sidebar:
         st.header("⚙️ Controls")
@@ -1101,7 +1108,7 @@ def main():
             if not hasattr(st.session_state, 'crawled_articles') or not st.session_state.crawled_articles:
                 st.warning("Please run crawler first")
             else:
-                with st.spinner("Analyzing articles (using batch requests to avoid rate limits)..."):
+                with st.spinner("Analyzing articles (FMP primary, EODHD fallback)..."):
                     recommendations = generate_recommendations(st.session_state.crawled_articles)
                     st.session_state.recommendations = recommendations
                     st.success("✅ Recommendations generated")
@@ -1111,7 +1118,7 @@ def main():
         st.markdown("### 🧪 Debug Tools")
         test_ticker = st.text_input("Test ticker (e.g., AAPL):", value="AAPL")
         if st.button("📍 Test Single Ticker", use_container_width=True):
-            st.info(f"Testing {test_ticker} with retry logic...")
+            st.info(f"Testing {test_ticker} with FMP & EODHD...")
             try:
                 test_metrics = get_enhanced_metrics(test_ticker)
                 st.write("**Metrics Retrieved:**")
@@ -1130,19 +1137,35 @@ def main():
         with st.expander("ℹ️ About"):
             st.markdown("""
             Stock Recommendation Engine using:
-            - **Batch yfinance downloads** (most important fix for rate limits)
-            - **Exponential backoff retry logic**
-            - **Streamlit caching** to reduce API calls
+            - **FMP** for comprehensive stock data (primary)
+            - **EODHD** as reliable fallback
             - News crawling from 7 financial sources
+            - FRED for market-wide CAPE ratio
             - AI-generated investment theses
             
-            **Key optimizations:**
-            ✅ Batch requests instead of individual calls
-            ✅ Exponential backoff retry (2s, 4s, 8s)
-            ✅ Single-threaded downloads
-            ✅ Sleep between requests (0.5s)
-            ✅ Aggressive caching (1 hour for metrics)
+            **Key Features:**
+            ✅ Dual API strategy for reliability
+            ✅ Exponential backoff retry logic
+            ✅ Smart caching (1 hour for quotes)
+            ✅ Error handling and graceful fallbacks
             """)
+        
+        with st.expander("🔑 API Configuration"):
+            st.write("**Configured APIs:**")
+            if FMP_API_KEY:
+                st.success("✅ FMP (Financial Modelling Prep)")
+            else:
+                st.warning("❌ FMP not configured")
+            
+            if EODHD_API_KEY:
+                st.success("✅ EODHD")
+            else:
+                st.warning("❌ EODHD not configured")
+            
+            if FRED_API_KEY:
+                st.success("✅ FRED (CAPE Ratio)")
+            else:
+                st.warning("❌ FRED not configured")
     
     # Fixed: Use hasattr instead of checking truthiness directly
     has_crawl_data = hasattr(st.session_state, 'last_crawl') and st.session_state.last_crawl is not None
