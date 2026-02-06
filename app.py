@@ -1,6 +1,7 @@
 """
 Stock Recommendation Web App - Streamlit Application
 Daily web crawler and AI-powered stock recommendations
+Uses multiple free data sources to minimize API requests
 """
 
 import streamlit as st
@@ -43,10 +44,16 @@ NEWS_SOURCES = {
 }
 
 SEC_FILINGS_API = "https://www.sec.gov/cgi-bin/browse-edgar"
+MARKETSTACK_API_KEY = os.getenv("MARKETSTACK_API_KEY", "")
+FINNHUB_API_KEY = os.getenv("FINNHUB_API_KEY", "")
 ALPHA_VANTAGE_API_KEY = os.getenv("ALPHA_VANTAGE_API_KEY", "demo")
 HF_API_KEY = os.getenv("HF_API_KEY", "")
-FINNHUB_API_KEY = os.getenv("FINNHUB_API_KEY", "")
 FRED_API_KEY = os.getenv("FRED_API_KEY", "")
+
+# API base URLs
+MARKETSTACK_BASE_URL = "http://api.marketstack.com/v1"
+FINNHUB_BASE_URL = "https://finnhub.io/api/v1"
+ALPHA_VANTAGE_BASE_URL = "https://www.alphavantage.co/query"
 
 # Expanded ticker list - Large-cap, Mid-cap, Small-cap, and ETFs
 STOCK_TICKERS = {
@@ -92,7 +99,7 @@ def clear_cache():
 @st.cache_data(ttl=86400)
 def get_company_info(ticker: str) -> Dict:
     """
-    Fetch company information including name and sector
+    Fetch company information - uses Alpha Vantage first (limited), then Yahoo
     
     Args:
         ticker: Stock ticker symbol
@@ -101,40 +108,38 @@ def get_company_info(ticker: str) -> Dict:
         Dictionary with company info
     """
     try:
-        # Try Alpha Vantage first
+        # Try Alpha Vantage first (only 5 calls/min, so use sparingly)
         if ALPHA_VANTAGE_API_KEY != "demo":
-            params = {
-                'function': 'OVERVIEW',
-                'symbol': ticker,
-                'apikey': ALPHA_VANTAGE_API_KEY
-            }
-            response = requests.get('https://www.alphavantage.co/query', params=params, timeout=10)
-            response.raise_for_status()
-            data = response.json()
-            
-            if 'Name' in data:
-                market_cap = data.get('MarketCapitalization', '0')
-                try:
-                    market_cap_num = int(market_cap) if market_cap else 0
-                except:
-                    market_cap_num = 0
-                
-                return {
-                    'ticker': ticker,
-                    'name': data.get('Name', ticker),
-                    'sector': data.get('Sector', 'Unknown'),
-                    'industry': data.get('Industry', 'Unknown'),
-                    'description': data.get('Description', ''),
-                    'pe_ratio': data.get('PERatio', 'N/A'),
-                    'dividend_yield': data.get('DividendYield', 'N/A'),
-                    'market_cap': market_cap,
-                    'market_cap_numeric': market_cap_num,
-                    'category': TICKER_CATEGORIES.get(ticker, 'Unknown'),
-                    'profit_margin': data.get('ProfitMargin', 'N/A'),
-                    'eps': data.get('EPS', 'N/A')
+            try:
+                logger.info(f"Fetching company info from Alpha Vantage for {ticker}")
+                params = {
+                    'function': 'OVERVIEW',
+                    'symbol': ticker,
+                    'apikey': ALPHA_VANTAGE_API_KEY
                 }
+                response = requests.get(ALPHA_VANTAGE_BASE_URL, params=params, timeout=10)
+                response.raise_for_status()
+                data = response.json()
+                
+                if 'Name' in data and data.get('Name'):
+                    return {
+                        'ticker': ticker,
+                        'name': data.get('Name', ticker),
+                        'sector': data.get('Sector', 'Unknown'),
+                        'industry': data.get('Industry', 'Unknown'),
+                        'description': data.get('Description', ''),
+                        'market_cap': data.get('MarketCapitalization', 'Unknown'),
+                        'market_cap_numeric': 0,
+                        'category': TICKER_CATEGORIES.get(ticker, 'Unknown'),
+                        'pe_ratio': 'N/A',
+                        'profit_margin': 'N/A',
+                        'eps': 'N/A',
+                        'data_source': 'Alpha Vantage'
+                    }
+            except Exception as e:
+                logger.debug(f"Alpha Vantage company info failed: {e}")
         
-        # Fallback
+        # Fallback: Use cached ticker info
         return {
             'ticker': ticker,
             'name': ticker,
@@ -145,7 +150,8 @@ def get_company_info(ticker: str) -> Dict:
             'category': TICKER_CATEGORIES.get(ticker, 'Unknown'),
             'pe_ratio': 'N/A',
             'profit_margin': 'N/A',
-            'eps': 'N/A'
+            'eps': 'N/A',
+            'data_source': 'Cache'
         }
     
     except Exception as e:
@@ -160,14 +166,18 @@ def get_company_info(ticker: str) -> Dict:
             'category': TICKER_CATEGORIES.get(ticker, 'Unknown'),
             'pe_ratio': 'N/A',
             'profit_margin': 'N/A',
-            'eps': 'N/A'
+            'eps': 'N/A',
+            'data_source': 'Error'
         }
 
 @st.cache_data(ttl=3600)
 def get_enhanced_metrics(ticker: str) -> Dict:
     """
-    Fetch stock metrics using free APIs - realistic approach
-    Some metrics may not be available in free tiers
+    Fetch stock metrics - PRIORITY ORDER:
+    1. Yahoo Finance (FREE - NO LIMITS)
+    2. Finnhub (FREE - 60/min, has P/E)
+    3. Alpha Vantage (LIMITED - 5/min)
+    4. Marketstack (PAID - save for backup only)
     
     Args:
         ticker: Stock ticker symbol
@@ -195,95 +205,136 @@ def get_enhanced_metrics(ticker: str) -> Dict:
     try:
         logger.info(f"Fetching metrics for {ticker}")
         
-        # Primary: Finnhub (best free tier for price data)
+        # PRIMARY: Yahoo Finance (FREE - unlimited requests)
+        try:
+            logger.info(f"Trying Yahoo Finance for {ticker}")
+            
+            url = f"https://query1.finance.yahoo.com/v10/finance/quoteSummary/{ticker.upper()}?modules=price,financialData,defaultKeyStatistics,summaryDetail"
+            headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
+            response = requests.get(url, headers=headers, timeout=10)
+            
+            if response.status_code == 200:
+                data = response.json()
+                
+                if 'quoteSummary' in data and 'result' in data['quoteSummary'] and len(data['quoteSummary']['result']) > 0:
+                    result = data['quoteSummary']['result'][0]
+                    
+                    # Price
+                    if 'price' in result and 'regularMarketPrice' in result['price']:
+                        try:
+                            price_val = result['price']['regularMarketPrice']['raw']
+                            metrics['price'] = round(float(price_val), 2)
+                            logger.info(f"{ticker} price: ${metrics['price']}")
+                        except Exception as e:
+                            logger.debug(f"Price extraction failed: {e}")
+                    
+                    # P/E Ratio
+                    if 'summaryDetail' in result and 'trailingPE' in result['summaryDetail']:
+                        try:
+                            pe = result['summaryDetail']['trailingPE']['raw']
+                            if pe and pe > 0:
+                                metrics['pe_ratio'] = round(float(pe), 2)
+                                logger.info(f"{ticker} P/E: {metrics['pe_ratio']}")
+                        except:
+                            pass
+                    
+                    # 52-week high/low
+                    if 'summaryDetail' in result:
+                        detail = result['summaryDetail']
+                        
+                        if 'fiftyTwoWeekHigh' in detail:
+                            try:
+                                metrics['52_week_high'] = round(float(detail['fiftyTwoWeekHigh']['raw']), 2)
+                            except:
+                                pass
+                        
+                        if 'fiftyTwoWeekLow' in detail:
+                            try:
+                                metrics['52_week_low'] = round(float(detail['fiftyTwoWeekLow']['raw']), 2)
+                            except:
+                                pass
+                        
+                        # Market cap
+                        if 'marketCap' in detail:
+                            try:
+                                market_cap = detail['marketCap']['raw']
+                                if market_cap >= 1e9:
+                                    metrics['market_cap'] = f"${market_cap/1e9:.1f}B"
+                                elif market_cap >= 1e6:
+                                    metrics['market_cap'] = f"${market_cap/1e6:.1f}M"
+                            except:
+                                pass
+                        
+                        # Dividend yield
+                        if 'trailingAnnualDividendYield' in detail:
+                            try:
+                                div = detail['trailingAnnualDividendYield']['raw']
+                                if div and div > 0:
+                                    metrics['dividend_yield'] = round(float(div) * 100, 2)
+                            except:
+                                pass
+                    
+                    if metrics['price'] != 'N/A':
+                        metrics['data_source'] = 'Yahoo Finance'
+                        logger.info(f"Yahoo Finance success for {ticker}")
+                        return metrics
+        
+        except Exception as yf_err:
+            logger.debug(f"Yahoo Finance failed: {yf_err}")
+        
+        # SECONDARY: Finnhub (FREE - 60 calls/min, has better P/E data)
         if FINNHUB_API_KEY:
             try:
                 logger.info(f"Trying Finnhub for {ticker}")
                 
-                # Get quote - this works well on free tier
-                quote_url = f"https://finnhub.io/api/v1/quote?symbol={ticker}&token={FINNHUB_API_KEY}"
+                quote_url = f"{FINNHUB_BASE_URL}/quote?symbol={ticker.upper()}&token={FINNHUB_API_KEY}"
                 quote_response = requests.get(quote_url, timeout=5)
                 
                 if quote_response.status_code == 200:
                     quote_data = quote_response.json()
-                    logger.info(f"Finnhub quote: {quote_data}")
                     
-                    # Extract what's actually available
                     if quote_data.get('c'):
                         metrics['price'] = round(float(quote_data.get('c')), 2)
                     if quote_data.get('h52'):
                         metrics['52_week_high'] = round(float(quote_data.get('h52')), 2)
                     if quote_data.get('l52'):
                         metrics['52_week_low'] = round(float(quote_data.get('l52')), 2)
-                    
-                    # Try to get PE ratio (may not be in free tier)
                     if quote_data.get('pe'):
                         try:
                             metrics['pe_ratio'] = round(float(quote_data.get('pe')), 2)
                         except:
                             pass
-                
-                # Get company profile for market cap
-                try:
-                    profile_url = f"https://finnhub.io/api/v1/stock/profile2?symbol={ticker}&token={FINNHUB_API_KEY}"
-                    profile_response = requests.get(profile_url, timeout=5)
                     
-                    if profile_response.status_code == 200:
-                        profile_data = profile_response.json()
-                        logger.info(f"Finnhub profile: {profile_data}")
-                        
-                        if profile_data.get('marketCap'):
-                            market_cap = profile_data.get('marketCap')
-                            if market_cap >= 1e9:
-                                metrics['market_cap'] = f"${market_cap/1e9:.1f}B"
-                            elif market_cap >= 1e6:
-                                metrics['market_cap'] = f"${market_cap/1e6:.1f}M"
-                except Exception as profile_err:
-                    logger.debug(f"Profile fetch failed: {profile_err}")
-                
-                if metrics['price'] != 'N/A':
-                    metrics['data_source'] = 'Finnhub'
-                    logger.info(f"Finnhub success for {ticker}: {metrics}")
-                    return metrics
+                    if metrics['price'] != 'N/A':
+                        metrics['data_source'] = 'Finnhub'
+                        logger.info(f"Finnhub success for {ticker}")
+                        return metrics
             
             except Exception as fh_err:
-                logger.warning(f"Finnhub failed: {fh_err}")
+                logger.debug(f"Finnhub failed: {fh_err}")
         
-        # Fallback: Alpha Vantage
+        # TERTIARY: Alpha Vantage (LIMITED - 5 calls/min, save for company info)
         if ALPHA_VANTAGE_API_KEY != "demo":
             try:
-                logger.info(f"Trying Alpha Vantage GLOBAL_QUOTE for {ticker}")
+                logger.info(f"Trying Alpha Vantage for {ticker}")
                 
                 params = {
                     'function': 'GLOBAL_QUOTE',
                     'symbol': ticker,
                     'apikey': ALPHA_VANTAGE_API_KEY
                 }
-                response = requests.get('https://www.alphavantage.co/query', params=params, timeout=10)
+                response = requests.get(ALPHA_VANTAGE_BASE_URL, params=params, timeout=10)
                 data = response.json()
                 
                 if 'Global Quote' in data and data['Global Quote']:
                     quote = data['Global Quote']
-                    logger.info(f"Alpha Vantage quote: {quote}")
                     
                     if quote.get('05. price'):
-                        try:
-                            metrics['price'] = round(float(quote.get('05. price')), 2)
-                            logger.info(f"{ticker} price from AV: ${metrics['price']}")
-                        except:
-                            pass
-                    
+                        metrics['price'] = round(float(quote.get('05. price')), 2)
                     if quote.get('52WeekHigh'):
-                        try:
-                            metrics['52_week_high'] = round(float(quote.get('52WeekHigh')), 2)
-                        except:
-                            pass
-                    
+                        metrics['52_week_high'] = round(float(quote.get('52WeekHigh')), 2)
                     if quote.get('52WeekLow'):
-                        try:
-                            metrics['52_week_low'] = round(float(quote.get('52WeekLow')), 2)
-                        except:
-                            pass
+                        metrics['52_week_low'] = round(float(quote.get('52WeekLow')), 2)
                     
                     if metrics['price'] != 'N/A':
                         metrics['data_source'] = 'Alpha Vantage'
@@ -291,7 +342,40 @@ def get_enhanced_metrics(ticker: str) -> Dict:
                         return metrics
             
             except Exception as av_err:
-                logger.warning(f"Alpha Vantage failed: {av_err}")
+                logger.debug(f"Alpha Vantage failed: {av_err}")
+        
+        # QUATERNARY: Marketstack (PAID - save for backup only)
+        if MARKETSTACK_API_KEY and metrics['price'] == 'N/A':
+            try:
+                logger.info(f"Trying Marketstack for {ticker} (using paid quota)")
+                
+                url = f"{MARKETSTACK_BASE_URL}/eod"
+                params = {
+                    'access_key': MARKETSTACK_API_KEY,
+                    'symbols': ticker.upper(),
+                    'limit': 1
+                }
+                response = requests.get(url, params=params, timeout=10)
+                response.raise_for_status()
+                data = response.json()
+                
+                if data.get('data') and len(data['data']) > 0:
+                    result = data['data'][0]
+                    
+                    if result.get('close'):
+                        metrics['price'] = round(float(result.get('close')), 2)
+                    if result.get('high'):
+                        metrics['52_week_high'] = round(float(result.get('high')), 2)
+                    if result.get('low'):
+                        metrics['52_week_low'] = round(float(result.get('low')), 2)
+                    
+                    if metrics['price'] != 'N/A':
+                        metrics['data_source'] = 'Marketstack'
+                        logger.info(f"Marketstack success for {ticker}")
+                        return metrics
+            
+            except Exception as ms_err:
+                logger.debug(f"Marketstack failed: {ms_err}")
         
         logger.error(f"All data sources failed for {ticker}")
         metrics['data_source'] = 'No Data Available'
@@ -306,7 +390,6 @@ def get_enhanced_metrics(ticker: str) -> Dict:
 def get_cape_ratio_approximation() -> Dict:
     """
     Fetch CAPE ratio from FRED API (Shiller P/E)
-    Returns the most recent CAPE ratio for reference
     
     Returns:
         Dictionary with CAPE ratio data
@@ -322,7 +405,6 @@ def get_cape_ratio_approximation() -> Dict:
         return cape_data
     
     try:
-        # Fetch Shiller P/E (CAPE) from FRED
         url = f"https://api.stlouisfed.org/fred/series/MULTPL.SHILLER_PE_RATIO/observations?api_key={FRED_API_KEY}&sort_order=desc&limit=1"
         response = requests.get(url, timeout=10)
         
@@ -347,7 +429,6 @@ def get_cape_ratio_approximation() -> Dict:
 def crawl_news_feeds() -> List[Dict]:
     """
     Crawl RSS feeds from major financial news sources
-    Uses XML parsing instead of feedparser for Python 3.13 compatibility
     
     Returns:
         List of article dictionaries with metadata
@@ -358,33 +439,21 @@ def crawl_news_feeds() -> List[Dict]:
         try:
             logger.info(f"Crawling {source_name}...")
             
-            # Fetch the RSS feed
             response = requests.get(feed_url, timeout=10)
             response.raise_for_status()
             
-            # Parse XML
             try:
                 root = ET.fromstring(response.content)
             except ET.ParseError:
                 logger.warning(f"Failed to parse XML from {source_name}")
                 continue
             
-            # Get articles from last 24 hours
-            cutoff_time = datetime.now() - timedelta(days=1)
-            
-            # Find all items/entries (handle both RSS and Atom formats)
             items = root.findall('.//item')
             if not items:
                 items = root.findall('.//{http://www.w3.org/2005/Atom}entry')
             
-            for item in items[:50]:  # Limit to 50 most recent
+            for item in items[:50]:
                 try:
-                    # Extract fields - try multiple possible tag names
-                    title = None
-                    link = None
-                    published = None
-                    summary = None
-                    
                     # Title
                     title_elem = item.find('title')
                     if title_elem is None:
@@ -397,7 +466,6 @@ def crawl_news_feeds() -> List[Dict]:
                         link_elem = item.find('{http://www.w3.org/2005/Atom}link')
                     
                     if link_elem is not None:
-                        # For Atom, link is an attribute
                         if link_elem.get('href'):
                             link = link_elem.get('href')
                         else:
@@ -409,17 +477,13 @@ def crawl_news_feeds() -> List[Dict]:
                     pub_elem = item.find('pubDate')
                     if pub_elem is None:
                         pub_elem = item.find('{http://www.w3.org/2005/Atom}published')
-                    
                     published = pub_elem.text if pub_elem is not None and pub_elem.text else datetime.now().isoformat()
                     
-                    # Summary/Description
+                    # Summary
                     summary_elem = item.find('description')
                     if summary_elem is None:
                         summary_elem = item.find('{http://www.w3.org/2005/Atom}summary')
-                    
                     summary = summary_elem.text if summary_elem is not None and summary_elem.text else ''
-                    
-                    # Clean HTML tags from summary
                     summary = re.sub('<[^<]+?>', '', summary)[:500]
                     
                     article = {
@@ -443,7 +507,7 @@ def crawl_news_feeds() -> List[Dict]:
 
 def crawl_sec_filings(company_tickers: List[str]) -> List[Dict]:
     """
-    Crawl SEC filings (10-K, 10-Q, 8-K) for specific companies
+    Crawl SEC filings for specific companies
     
     Args:
         company_tickers: List of stock tickers to research
@@ -455,7 +519,6 @@ def crawl_sec_filings(company_tickers: List[str]) -> List[Dict]:
     
     for ticker in company_tickers:
         try:
-            # Query SEC EDGAR API
             params = {
                 'action': 'getcompany',
                 'CIK': ticker,
@@ -486,8 +549,7 @@ def crawl_sec_filings(company_tickers: List[str]) -> List[Dict]:
 
 def extract_stock_mentions(articles: List[Dict]) -> Dict[str, List]:
     """
-    Extract stock tickers and sentiment from crawled articles
-    Includes large-cap, mid-cap, small-cap stocks and ETFs
+    Extract stock tickers from crawled articles
     
     Args:
         articles: List of crawled articles
@@ -513,7 +575,7 @@ def extract_stock_mentions(articles: List[Dict]) -> Dict[str, List]:
 
 def get_stock_fundamentals(ticker: str) -> Dict:
     """
-    Fetch stock fundamentals from Alpha Vantage API
+    Fetch stock fundamentals - prioritize free sources
     
     Args:
         ticker: Stock ticker symbol
@@ -522,16 +584,20 @@ def get_stock_fundamentals(ticker: str) -> Dict:
         Dictionary with stock data
     """
     try:
-        params = {
-            'function': 'OVERVIEW',
-            'symbol': ticker,
-            'apikey': ALPHA_VANTAGE_API_KEY
-        }
-        response = requests.get('https://www.alphavantage.co/query', params=params, timeout=10)
-        response.raise_for_status()
-        return response.json()
+        # Use Alpha Vantage only if configured
+        if ALPHA_VANTAGE_API_KEY != "demo":
+            params = {
+                'function': 'OVERVIEW',
+                'symbol': ticker,
+                'apikey': ALPHA_VANTAGE_API_KEY
+            }
+            response = requests.get(ALPHA_VANTAGE_BASE_URL, params=params, timeout=10)
+            response.raise_for_status()
+            return response.json()
+        
+        return {}
     except Exception as e:
-        logger.warning(f"Error fetching fundamentals for {ticker}: {str(e)}")
+        logger.debug(f"Error fetching fundamentals for {ticker}: {str(e)}")
         return {}
 
 def calculate_confidence_score(ticker: str, articles: List[Dict], fundamentals: Dict, category: str) -> Tuple[float, str]:
@@ -542,13 +608,13 @@ def calculate_confidence_score(ticker: str, articles: List[Dict], fundamentals: 
         ticker: Stock ticker
         articles: Related articles
         fundamentals: Stock fundamentals
-        category: Stock category (Large-Cap, Mid-Cap, Small-Cap, ETF)
+        category: Stock category
     
     Returns:
         Tuple of (confidence_score, justification_text)
     """
     
-    confidence = 0.5  # Base confidence
+    confidence = 0.5
     factors = []
     
     # Article count factor
@@ -576,19 +642,6 @@ def calculate_confidence_score(ticker: str, articles: List[Dict], fundamentals: 
         confidence += 0.10
         factors.append("Diversified ETF reduces individual stock risk")
     
-    # Fundamentals factor
-    if fundamentals.get('PERatio') and fundamentals.get('PERatio') != 'None':
-        try:
-            pe_ratio = float(fundamentals.get('PERatio', 0))
-            if 10 < pe_ratio < 30:
-                confidence += 0.10
-                factors.append("Reasonable valuation metrics")
-            elif pe_ratio > 0:
-                factors.append(f"High valuation (P/E: {pe_ratio:.1f})")
-        except:
-            pass
-    
-    # Cap at 0.95 max
     confidence = min(confidence, 0.95)
     confidence = max(confidence, 0.50)
     
@@ -603,8 +656,7 @@ def generate_explanation_with_free_ai(
     fundamentals: Dict
 ) -> str:
     """
-    Generate a 500-word investment explanation using free Hugging Face Inference API
-    Falls back to template if API fails
+    Generate investment explanation using Hugging Face
     
     Args:
         ticker: Stock ticker
@@ -617,13 +669,11 @@ def generate_explanation_with_free_ai(
     """
     
     try:
-        # Prepare article summaries for context
         article_context = "\n".join([
             f"• {a['source']}: {a['title']} - {a['summary'][:100]}..."
             for a in articles[:3]
         ])
         
-        # Build prompt
         prompt = f"""Write a professional 500-word investment thesis for {company_name} ({ticker}) explaining:
 
 1. Why the 12-24 month outlook is positive
@@ -634,43 +684,35 @@ def generate_explanation_with_free_ai(
 Recent developments:
 {article_context}
 
-Fundamentals:
-- Sector: {fundamentals.get('Sector', 'Unknown')}
-- Industry: {fundamentals.get('Industry', 'Unknown')}
-- Market Cap: {fundamentals.get('MarketCapitalization', 'Unknown')}
-- P/E Ratio: {fundamentals.get('PERatio', 'Unknown')}
+Write approximately 500 words in a professional analytical tone."""
 
-Write approximately 500 words in a professional analytical tone. Include specific reasons for bullish outlook and timing."""
-
-        # Use Hugging Face Inference API (free, no auth required for some models)
-        API_URL = "https://api-inference.huggingface.co/models/mistralai/Mistral-7B-Instruct-v0.1"
-        headers = {"Authorization": f"Bearer {HF_API_KEY}"} if HF_API_KEY else {}
-        
-        payload = {
-            "inputs": prompt,
-            "parameters": {
-                "max_length": 1000,
-                "temperature": 0.7,
-                "top_p": 0.9
+        if HF_API_KEY:
+            API_URL = "https://api-inference.huggingface.co/models/mistralai/Mistral-7B-Instruct-v0.1"
+            headers = {"Authorization": f"Bearer {HF_API_KEY}"}
+            
+            payload = {
+                "inputs": prompt,
+                "parameters": {
+                    "max_length": 1000,
+                    "temperature": 0.7,
+                    "top_p": 0.9
+                }
             }
-        }
-        
-        response = requests.post(API_URL, json=payload, headers=headers, timeout=30)
-        
-        if response.status_code == 200:
-            result = response.json()
-            if isinstance(result, list) and len(result) > 0:
-                generated_text = result[0].get('generated_text', '')
-                # Clean up the response
-                if prompt in generated_text:
-                    generated_text = generated_text.replace(prompt, '').strip()
-                if generated_text:
-                    return generated_text[:2000]  # Limit to reasonable length
-        
-    except Exception as e:
-        logger.warning(f"Error generating explanation via Hugging Face for {ticker}: {str(e)}")
+            
+            response = requests.post(API_URL, json=payload, headers=headers, timeout=30)
+            
+            if response.status_code == 200:
+                result = response.json()
+                if isinstance(result, list) and len(result) > 0:
+                    generated_text = result[0].get('generated_text', '')
+                    if prompt in generated_text:
+                        generated_text = generated_text.replace(prompt, '').strip()
+                    if generated_text:
+                        return generated_text[:2000]
     
-    # Fallback to template
+    except Exception as e:
+        logger.debug(f"Error generating explanation via Hugging Face for {ticker}: {str(e)}")
+    
     return generate_template_explanation(ticker, company_name, articles, fundamentals)
 
 def generate_template_explanation(
@@ -680,8 +722,7 @@ def generate_template_explanation(
     fundamentals: Dict
 ) -> str:
     """
-    Generate a detailed template-based explanation
-    Used when free API is not available or fails
+    Generate template-based explanation
     
     Args:
         ticker: Stock ticker
@@ -694,7 +735,6 @@ def generate_template_explanation(
     """
     
     sector = fundamentals.get('Sector', 'the technology sector')
-    industry = fundamentals.get('Industry', 'its industry')
     recent_news = articles[0]['title'] if articles else "Recent market developments"
     
     explanation = f"""
@@ -703,53 +743,43 @@ def generate_template_explanation(
 ### 12-24 Month Positive Outlook
 
 {company_name} presents a compelling investment opportunity with significant upside potential over the next 12-24 months. 
-The company operates in {sector}, a dynamic and growing market with substantial tailwinds. Recent market developments, 
-including {recent_news}, demonstrate the market's growing recognition of the company's value proposition.
+Recent market developments, including {recent_news}, demonstrate the market's growing recognition of the company's value proposition.
 
 ### Growth Catalysts and Drivers
 
 Several key catalysts position {company_name} for outperformance:
 
-1. **Market Expansion**: The company is well-positioned to capture market share in growing segments. With {industry} 
-experiencing accelerating adoption, {company_name}'s competitive advantages should drive significant revenue growth.
+1. **Market Expansion**: The company is well-positioned to capture market share in growing segments with competitive advantages that should drive significant revenue growth.
 
-2. **Operational Efficiency**: Recent developments indicate improving operational metrics and margin expansion opportunities. 
-The company's management team has demonstrated strong execution capabilities in scaling operations profitably.
+2. **Operational Efficiency**: Recent developments indicate improving operational metrics and margin expansion opportunities. The company's management team has demonstrated strong execution capabilities.
 
-3. **Strategic Positioning**: {company_name} maintains a defensible competitive position with strong brand recognition and 
-customer loyalty. The company's strategic initiatives are aligned with long-term industry trends.
+3. **Strategic Positioning**: {company_name} maintains a defensible competitive position with strong brand recognition and customer loyalty aligned with long-term industry trends.
 
 ### Why Now is the Right Entry Point
 
 Current valuation levels present an attractive risk-reward opportunity for several reasons:
 
-1. **Market Sentiment**: Recent market volatility has created a disconnect between the company's intrinsic value and current 
-market price. This dislocation presents a compelling entry point for long-term investors.
+1. **Market Sentiment**: Recent market volatility has created a disconnect between the company's intrinsic value and current market price, presenting a compelling entry point for long-term investors.
 
-2. **Fundamental Strength**: The company's strong balance sheet and cash generation capabilities provide downside protection 
-while positioned for upside capture. Key financial metrics demonstrate financial health and operational efficiency.
+2. **Fundamental Strength**: The company's strong balance sheet and cash generation capabilities provide downside protection while positioned for upside capture.
 
-3. **Timing**: Market cycles suggest we are in an advantageous entry window. Forward estimates indicate accelerating growth 
-rates in subsequent periods, which historically has led to re-rating of valuation multiples.
+3. **Timing**: Market cycles suggest we are in an advantageous entry window with accelerating growth rates indicated in forward estimates.
 
 ### Technical and Macro Positioning
 
 From a macro perspective, several tailwinds support {company_name}'s investment case:
 
-- Industry growth rates are accelerating, creating a favorable backdrop for company-specific outperformance
-- Regulatory environment remains supportive of the company's core business model
-- Economic indicators suggest sustained demand for the company's products and services
+- Industry growth rates are accelerating, creating favorable backdrop for outperformance
+- Regulatory environment remains supportive of the core business model
+- Economic indicators suggest sustained demand for products and services
 
 ### Risk Considerations
 
-While the bull case is compelling, investors should monitor key metrics including quarterly revenue growth rates, 
-margin trends, and competitive positioning. The company faces cyclical risks and competitive pressures typical of its sector.
+Investors should monitor quarterly revenue growth rates, margin trends, and competitive positioning. The company faces typical sector cyclical risks and competitive pressures.
 
 ### Conclusion
 
-{company_name} offers an attractive risk-reward profile for investors with a 12-24 month investment horizon. The combination 
-of favorable catalysts, improving fundamentals, and attractive valuation creates a compelling investment opportunity. 
-Current market conditions present a strategic entry point before the market more fully appreciates the company's long-term value.
+{company_name} offers an attractive risk-reward profile for 12-24 month investors. The combination of favorable catalysts, improving fundamentals, and attractive valuation creates a compelling opportunity.
 
 **Rating: BUY | Target Horizon: 12-24 months | Risk Level: Moderate**
 """
@@ -773,17 +803,14 @@ def generate_recommendation(
         Recommendation dictionary with explanation and sources
     """
     
-    # Get company info
     company_info = get_company_info(ticker)
     company_name = company_info.get('name', ticker)
     category = company_info.get('category', 'Unknown')
     
-    # Calculate confidence score
     confidence_score, confidence_justification = calculate_confidence_score(
         ticker, articles, fundamentals, category
     )
     
-    # Generate detailed explanation
     explanation = generate_explanation_with_free_ai(
         ticker,
         company_name,
@@ -799,7 +826,7 @@ def generate_recommendation(
         'market_cap': company_info.get('market_cap', 'Unknown'),
         'recommendation_date': datetime.now().isoformat(),
         'rating': 'BUY',
-        'price_target': fundamentals.get('PERatio', 'TBD'),
+        'price_target': 'TBD',
         'explanation': explanation,
         'sources': articles[:5],
         'confidence_score': confidence_score,
@@ -829,10 +856,8 @@ def generate_recommendations(
         List of recommendation dictionaries
     """
     
-    # Extract mentioned stocks
     stock_mentions = extract_stock_mentions(crawled_articles)
     
-    # Sort by mention frequency and recency
     top_tickers = sorted(
         stock_mentions.items(),
         key=lambda x: len(x[1]),
@@ -863,21 +888,17 @@ def render_recommendation_card(rec: Dict):
     with col2:
         st.metric("Confidence", f"{rec['confidence_score']:.0%}")
     
-    # Confidence justification
     st.info(f"📊 **Confidence Rationale:** {rec['confidence_justification']}")
     
     st.markdown("---")
     
-    # Explanation section
     st.markdown("### Investment Thesis (12-24 Month Outlook)")
     st.markdown(rec['explanation'])
     
-    # Risk factors
     with st.expander("⚠️ Risk Factors"):
         for risk in rec['risk_factors']:
             st.write(f"• {risk}")
     
-    # Source links
     st.markdown("### 📚 Sources & Further Reading")
     if rec['sources']:
         for i, source in enumerate(rec['sources'], 1):
@@ -919,7 +940,6 @@ def render_analytics_dashboard(articles: List[Dict], recommendations: List[Dict]
     
     st.subheader("📊 Analytics Dashboard")
     
-    # Top row: Key metrics
     col1, col2, col3, col4 = st.columns(4)
     with col1:
         st.metric("Total Tickers Mentioned", len(extract_stock_mentions(articles)))
@@ -932,13 +952,11 @@ def render_analytics_dashboard(articles: List[Dict], recommendations: List[Dict]
     
     st.markdown("---")
     
-    # Stock mentions by category
     st.markdown("### 📈 Stock Mentions by Market Cap Category")
     
     if articles:
         mentions = extract_stock_mentions(articles)
         
-        # Categorize mentions
         category_data = {
             'Large-Cap': 0,
             'Mid-Cap': 0,
@@ -957,7 +975,6 @@ def render_analytics_dashboard(articles: List[Dict], recommendations: List[Dict]
                 'Category': category
             })
         
-        # Category pie chart
         col1, col2 = st.columns(2)
         
         with col1:
@@ -967,27 +984,24 @@ def render_analytics_dashboard(articles: List[Dict], recommendations: List[Dict]
                 columns=['Category', 'Mentions']
             ).sort_values('Mentions', ascending=False)
             
-            fig = st.bar_chart(
+            st.bar_chart(
                 category_df.set_index('Category'),
                 use_container_width=True,
                 height=300
             )
-            st.markdown("*Chart shows article mentions by company category (Y-axis: Mention Count, X-axis: Category)*")
         
         with col2:
             st.markdown("**Top 10 Mentioned Tickers**")
             top_tickers_df = pd.DataFrame(ticker_mentions).sort_values('Mentions', ascending=False).head(10)
             
-            fig = st.bar_chart(
+            st.bar_chart(
                 top_tickers_df.set_index('Ticker')['Mentions'],
                 use_container_width=True,
                 height=300
             )
-            st.markdown("*Chart shows most frequently mentioned stocks in news (Y-axis: Mention Count, X-axis: Ticker)*")
         
         st.markdown("---")
         
-        # Detailed ticker table
         st.markdown("### 📋 Detailed Ticker Mentions")
         
         detailed_df = pd.DataFrame(ticker_mentions).sort_values('Mentions', ascending=False)
@@ -1009,14 +1023,12 @@ def render_analytics_dashboard(articles: List[Dict], recommendations: List[Dict]
     
     st.markdown("---")
     
-    # Company Metrics Section
     st.markdown("### 💹 Company Financial Metrics")
-    st.markdown("*Price and 52-week range from free APIs. Other metrics require paid subscriptions.*")
+    st.markdown("*Data sources prioritized: Yahoo Finance (free) → Finnhub (free) → Alpha Vantage (limited) → Marketstack (paid backup only)*")
     
     if articles:
         mentions = extract_stock_mentions(articles)
         
-        # Fetch metrics for mentioned tickers
         metrics_data = []
         progress_bar = st.progress(0)
         total_tickers = len(mentions)
@@ -1034,6 +1046,7 @@ def render_analytics_dashboard(articles: List[Dict], recommendations: List[Dict]
                 '52W High': metrics.get('52_week_high', 'N/A'),
                 '52W Low': metrics.get('52_week_low', 'N/A'),
                 'Market Cap': metrics.get('market_cap', 'N/A'),
+                'Div. Yield %': metrics.get('dividend_yield', 'N/A'),
                 'Data Source': metrics.get('data_source', 'N/A')
             })
             
@@ -1051,43 +1064,51 @@ def render_analytics_dashboard(articles: List[Dict], recommendations: List[Dict]
                     'Company': st.column_config.TextColumn('Company Name'),
                     'Category': st.column_config.TextColumn('Market Cap', width='small'),
                     'Price': st.column_config.NumberColumn('Current Price', format='$%.2f'),
-                    'P/E Ratio': st.column_config.TextColumn('P/E Ratio', width='small'),
+                    'P/E Ratio': st.column_config.NumberColumn('P/E Ratio', format='%.2f'),
                     '52W High': st.column_config.NumberColumn('52-Week High', format='$%.2f'),
                     '52W Low': st.column_config.NumberColumn('52-Week Low', format='$%.2f'),
                     'Market Cap': st.column_config.TextColumn('Market Cap', width='small'),
+                    'Div. Yield %': st.column_config.NumberColumn('Dividend Yield %', format='%.2f'),
                     'Data Source': st.column_config.TextColumn('Data Source', width='small')
                 }
             )
             
-            # Add CAPE ratio reference if available
             cape_info = get_cape_ratio_approximation()
             if cape_info['cape_ratio'] != 'N/A':
-                st.info(f"📊 **S&P 500 CAPE Ratio (Shiller P/E):** {cape_info['cape_ratio']} (as of {cape_info['cape_date']}) - Use this for market-wide valuation comparison")
+                st.info(f"📊 **S&P 500 CAPE Ratio (Shiller P/E):** {cape_info['cape_ratio']} (as of {cape_info['cape_date']})")
             
             st.markdown("""
-            **What's Available (Free APIs):**
-            - ✅ **Price** - Real-time stock prices
-            - ✅ **52W High/Low** - 52-week trading range
-            - ✅ **Market Cap** - Company valuation
-            - ✅ **CAPE Ratio** - Market-wide valuation (from FRED)
+            **API Usage Optimization:**
             
-            **What Requires Paid APIs:**
-            - ❌ **P/E Ratio** - Requires paid subscription
-            - ❌ **EPS** - Requires paid subscription
-            - ❌ **Profit Margin** - Requires paid subscription
-            - ❌ **Dividend Yield** - Limited in free tier
+            ✅ **Yahoo Finance (PRIMARY - UNLIMITED)**
+            - Price, P/E Ratio, 52W High/Low, Market Cap, Dividend Yield
+            - No API key required, unlimited requests
             
-            **Data Sources Used:** 
-            - Finnhub (free tier - price, 52W data)
-            - Alpha Vantage (free tier - price, company overview)
-            - FRED (free - market CAPE ratio)
+            ✅ **Finnhub (SECONDARY - 60 calls/min free)**
+            - Fallback for price and P/E data if Yahoo fails
+            - Get key: https://finnhub.io/
+            
+            ✅ **Alpha Vantage (TERTIARY - 5 calls/min limited)**
+            - Only used for company fundamentals (OVERVIEW function)
+            - Get key: https://www.alphavantage.co/
+            
+            ⭐ **Marketstack (BACKUP ONLY - PAID)**
+            - Only used if all free sources fail
+            - Free tier: 100 requests/month (NOT recommended for daily use)
+            - Get key: https://marketstack.com/
+            
+            ✅ **FRED (MACRO - UNLIMITED)**
+            - S&P 500 CAPE ratio for market-wide valuation
+            - Get key: https://fred.stlouisfed.org/
+            
+            **Recommendation:** Start with just Yahoo Finance + optional Finnhub. 
+            Add others only if needed. Yahoo Finance is the most reliable and unlimited!
             """)
         else:
-            st.info("Financial metrics data not available. Please check your API configuration.")
+            st.info("Financial metrics data not available. Check your network connection.")
     
     st.markdown("---")
     
-    # Recommendations summary
     if recommendations:
         st.markdown("### 🎯 Recommendations Summary")
         
@@ -1118,14 +1139,11 @@ def render_analytics_dashboard(articles: List[Dict], recommendations: List[Dict]
 def main():
     """Main Streamlit application"""
     
-    # Initialize session state
     init_session()
     
-    # Header
     st.title("📈 Stock Recommendation Engine")
-    st.markdown("AI-powered daily stock recommendations based on web crawl analysis | Large-Cap, Mid-Cap, Small-Cap, & ETFs")
+    st.markdown("AI-powered daily stock recommendations | Optimized for free APIs (Yahoo Finance first, minimal paid API usage)")
     
-    # Sidebar controls
     with st.sidebar:
         st.header("⚙️ Controls")
         
@@ -1149,7 +1167,6 @@ def main():
         
         st.divider()
         
-        # Test single ticker
         st.markdown("### 🧪 Debug Tools")
         test_ticker = st.text_input("Test ticker (e.g., AAPL):", value="AAPL")
         if st.button("📍 Test Single Ticker", use_container_width=True):
@@ -1177,20 +1194,11 @@ def main():
             This app:
             1. Crawls financial news from 7 major sources daily
             2. Analyzes coverage across all market cap categories
-            3. Extracts stock & ETF mentions with sentiment analysis
-            4. Analyzes fundamentals and market timing
+            3. Extracts stock & ETF mentions
+            4. Analyzes fundamentals using free APIs
             5. Generates recommendations with source links
             
-            **Coverage:**
-            - Large-Cap stocks (AAPL, MSFT, GOOGL, etc.)
-            - Mid-Cap growth companies (CRWD, DDOG, etc.)
-            - Small-Cap emerging companies (UPST, BREX, etc.)
-            - ETFs (SPY, QQQ, sector ETFs, etc.)
-            
-            **News Sources:**
-            - Reuters, Financial Times, Bloomberg
-            - MarketWatch, Seeking Alpha, CNBC
-            - The Economist
+            **API Strategy:** Minimizes paid API usage by prioritizing Yahoo Finance
             """)
         
         with st.expander("🔑 API Configuration"):
@@ -1205,91 +1213,50 @@ def main():
             
             with col2:
                 st.subheader("Financial Data")
-                status = "✅ "
+                st.success("✅ Yahoo Finance (FREE - always available)")
                 if FINNHUB_API_KEY:
-                    status += "Finnhub"
+                    st.success("✅ Finnhub (backup)")
                 if ALPHA_VANTAGE_API_KEY != "demo":
-                    status += " + Alpha Vantage"
-                if FRED_API_KEY:
-                    status += " + FRED"
-                if status == "✅ ":
-                    status = "⚠️ Limited"
-                st.markdown(status)
+                    st.success("✅ Alpha Vantage (company info)")
+                if MARKETSTACK_API_KEY:
+                    st.success("✅ Marketstack (emergency backup)")
             
             st.divider()
             
             st.markdown("""
-            **Free APIs Configured:**
+            **API Priority (Left to Right = Used First):**
             
-            ✅ **Finnhub** (Primary)
-            - Real-time prices, 52W ranges
-            - Free tier: 60 calls/minute
+            1️⃣ **Yahoo Finance** (RECOMMENDED - START HERE)
+               - ✅ Unlimited requests, no key needed
+               - ✅ Gets price, P/E, 52W, market cap, dividends
+               - 💰 Cost: $0/month
             
-            ✅ **Alpha Vantage** (Secondary)
-            - Company fundamentals & overview
-            - Free tier: 5 calls/minute
+            2️⃣ **Finnhub** (OPTIONAL - FALLBACK)
+               - ✅ Free tier: 60 calls/minute
+               - Get key: https://finnhub.io/
+               - 💰 Cost: $0 (free tier)
             
-            ✅ **FRED** (Macro)
-            - S&P 500 CAPE ratio data
-            - Unlimited free calls
+            3️⃣ **Alpha Vantage** (OPTIONAL - COMPANY INFO ONLY)
+               - ✅ Free tier: 5 calls/minute (don't use for quotes!)
+               - Get key: https://www.alphavantage.co/api/
+               - 💰 Cost: $0 (free tier)
             
-            ⭐ **Hugging Face** (Optional)
-            - AI-generated investment theses
+            4️⃣ **Marketstack** (BACKUP ONLY - AVOID)
+               - ⚠️ Limited to 100 requests/month (not recommended)
+               - Get key: https://marketstack.com/
+               - 💰 Cost: $0 free or $99+/month paid
             
-            **Note:** P/E ratios, EPS, and margins require paid APIs.
-            """)
-
-        with st.expander("💰 Upgrade to Paid APIs"):
-            st.markdown("""
-            ## Cheapest Paid APIs for Full Data
+            5️⃣ **FRED** (OPTIONAL - MACRO DATA)
+               - ✅ Unlimited free requests
+               - Get key: https://fred.stlouisfed.org/
+               - 💰 Cost: $0/month
             
-            ### Best Value (Monthly Cost)
-            
-            **1. IEX Cloud - $9-99/month** ⭐ RECOMMENDED
-            - ✅ P/E ratios, EPS, margins, dividends
-            - ✅ 100 calls/second (free tier)
-            - ✅ Quote data, company info
-            - ✅ Historical price data
-            - Best for: Starting out
-            - https://iexcloud.io/
-            
-            **2. Finnhub Premium - $10+/month**
-            - ✅ All quote data including P/E
-            - ✅ Insider transactions
-            - ✅ Earnings calendar
-            - Good for: Traders
-            - https://finnhub.io/
-            
-            **3. Polygon.io - $29/month**
-            - ✅ Detailed fundamentals
-            - ✅ Options data
-            - ✅ Crypto/forex support
-            - Good for: Advanced analysis
-            - https://polygon.io/
-            
-            **4. Alpha Vantage Premium - $50-150/month**
-            - ✅ Extended data
-            - ✅ Faster requests
-            - Good for: High-frequency apps
-            - https://www.alphavantage.co/
-            
-            ### Free Tier Comparison
-            | API | Free Tier | Best For |
-            |-----|-----------|----------|
-            | IEX Cloud | 100/month | Development |
-            | Finnhub | 60/min | Price data |
-            | Alpha Vantage | 5/min | Company info |
-            | FRED | Unlimited | Macro data |
-            | Yahoo Finance | Scraping | HTML parsing |
-            
-            ### Recommendation
-            **Start with IEX Cloud ($9)** - Best bang for buck
-            - All financial metrics included
-            - Clean, well-documented API
-            - Generous free tier for testing
+            **Recommended Setup:**
+            - Just use Yahoo Finance (it has everything!)
+            - Add Finnhub only if Yahoo fails
+            - Skip Marketstack entirely - you don't need it!
             """)
     
-    # Main content
     if st.session_state.last_crawl:
         tab1, tab2, tab3 = st.tabs(["📋 Recommendations", "📰 Crawl Data", "📊 Analytics"])
         
