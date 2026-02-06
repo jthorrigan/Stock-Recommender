@@ -1,6 +1,6 @@
 """
 Stock Recommendation Web App - Streamlit Application
-WITH DIAGNOSTIC OUTPUT TO HELP DEBUG API ISSUES
+FIXED API KEY LOADING FOR STREAMLIT CLOUD
 """
 
 import streamlit as st
@@ -18,7 +18,7 @@ import numpy as np
 import time
 
 # Configure logging
-logging.basicConfig(level=logging.DEBUG)  # Changed to DEBUG
+logging.basicConfig(level=logging.DEBUG)
 logger = logging.getLogger(__name__)
 
 # Set page configuration
@@ -28,6 +28,29 @@ st.set_page_config(
     layout="wide",
     initial_sidebar_state="expanded"
 )
+
+# ============================================================================
+# FIXED API KEY LOADING
+# ============================================================================
+
+# IMPORTANT: This works for BOTH local (.env) and Streamlit Cloud (secrets.toml)
+FMP_API_KEY = st.secrets.get("fmp_api_key") if "fmp_api_key" in st.secrets else os.getenv("FMP_API_KEY", "")
+EODHD_API_KEY = st.secrets.get("eodhd_api_key") if "eodhd_api_key" in st.secrets else os.getenv("EODHD_API_KEY", "")
+HF_API_KEY = st.secrets.get("hf_api_key") if "hf_api_key" in st.secrets else os.getenv("HF_API_KEY", "")
+FRED_API_KEY = st.secrets.get("fred_api_key") if "fred_api_key" in st.secrets else os.getenv("FRED_API_KEY", "")
+
+# Store API keys source for debugging
+API_SOURCE = "Streamlit Secrets" if "fmp_api_key" in st.secrets else "Environment Variables"
+
+# Log API key status
+logger.info(f"API Keys Source: {API_SOURCE}")
+logger.info(f"FMP_API_KEY: {'✅ Loaded' if FMP_API_KEY else '❌ Missing'}")
+logger.info(f"EODHD_API_KEY: {'✅ Loaded' if EODHD_API_KEY else '❌ Missing'}")
+logger.info(f"FRED_API_KEY: {'✅ Loaded' if FRED_API_KEY else '❌ Missing'}")
+
+# API endpoints
+FMP_BASE_URL = "https://financialmodelingprep.com/api/v3"
+EODHD_BASE_URL = "https://eodhd.com/api"
 
 # ============================================================================
 # CONFIGURATION & CONSTANTS
@@ -44,60 +67,6 @@ NEWS_SOURCES = {
 }
 
 SEC_FILINGS_API = "https://www.sec.gov/cgi-bin/browse-edgar"
-
-# ============================================================================
-# API KEY LOADING WITH DIAGNOSTICS
-# ============================================================================
-
-def load_api_keys():
-    """Load API keys with detailed diagnostics"""
-    keys = {}
-    
-    # Try Streamlit secrets first
-    try:
-        fmp_key = st.secrets.get("fmp_api_key", "")
-        eodhd_key = st.secrets.get("eodhd_api_key", "")
-        hf_key = st.secrets.get("hf_api_key", "")
-        fred_key = st.secrets.get("fred_api_key", "")
-        
-        if fmp_key or eodhd_key:
-            keys['fmp'] = fmp_key
-            keys['eodhd'] = eodhd_key
-            keys['hf'] = hf_key
-            keys['fred'] = fred_key
-            keys['source'] = 'Streamlit Secrets'
-            return keys
-    except Exception as e:
-        logger.debug(f"Streamlit secrets not available: {e}")
-    
-    # Fallback to environment variables
-    try:
-        keys['fmp'] = os.getenv("FMP_API_KEY", "")
-        keys['eodhd'] = os.getenv("EODHD_API_KEY", "")
-        keys['hf'] = os.getenv("HF_API_KEY", "")
-        keys['fred'] = os.getenv("FRED_API_KEY", "")
-        keys['source'] = 'Environment Variables (.env)'
-        return keys
-    except Exception as e:
-        logger.error(f"Failed to load environment variables: {e}")
-        return {
-            'fmp': '',
-            'eodhd': '',
-            'hf': '',
-            'fred': '',
-            'source': 'NONE - NO KEYS FOUND'
-        }
-
-# Load keys
-API_KEYS = load_api_keys()
-FMP_API_KEY = API_KEYS.get('fmp', '')
-EODHD_API_KEY = API_KEYS.get('eodhd', '')
-HF_API_KEY = API_KEYS.get('hf', '')
-FRED_API_KEY = API_KEYS.get('fred', '')
-
-# API endpoints
-FMP_BASE_URL = "https://financialmodelingprep.com/api/v3"
-EODHD_BASE_URL = "https://eodhd.com/api"
 
 # Expanded ticker list
 STOCK_TICKERS = {
@@ -137,7 +106,7 @@ def clear_cache():
     logger.info("Cache cleared")
 
 # ============================================================================
-# RETRY LOGIC WITH EXPONENTIAL BACKOFF
+# RETRY LOGIC
 # ============================================================================
 
 def retry_with_backoff(func, max_retries=3, backoff_factor=2):
@@ -148,7 +117,7 @@ def retry_with_backoff(func, max_retries=3, backoff_factor=2):
         except Exception as e:
             if attempt < max_retries - 1:
                 wait_time = backoff_factor ** attempt
-                logger.warning(f"Attempt {attempt + 1} failed: {str(e)}. Retrying in {wait_time}s...")
+                logger.warning(f"Attempt {attempt + 1} failed. Retrying in {wait_time}s...")
                 time.sleep(wait_time)
             else:
                 logger.error(f"All {max_retries} attempts failed: {str(e)}")
@@ -160,29 +129,22 @@ def retry_with_backoff(func, max_retries=3, backoff_factor=2):
 
 @st.cache_data(ttl=3600)
 def get_fmp_quote(ticker: str) -> Dict:
-    """Fetch stock quote from FMP with detailed diagnostics"""
+    """Fetch stock quote from FMP"""
     
-    if not FMP_API_KEY or FMP_API_KEY == "YOUR_FMP_API_KEY_HERE":
-        logger.error(f"FMP_API_KEY not configured or is placeholder")
-        return {'error': 'FMP_API_KEY not configured'}
+    if not FMP_API_KEY:
+        logger.error("FMP_API_KEY is empty")
+        return {}
     
     try:
-        logger.info(f"[FMP QUOTE] Fetching for {ticker}")
-        logger.debug(f"FMP_API_KEY exists: {bool(FMP_API_KEY)}, length: {len(FMP_API_KEY) if FMP_API_KEY else 0}")
+        logger.info(f"[FMP QUOTE] Fetching {ticker}")
         
         def fetch():
             url = f"{FMP_BASE_URL}/quote/{ticker}"
             params = {'apikey': FMP_API_KEY}
-            logger.debug(f"FMP URL: {url}")
-            logger.debug(f"FMP Params: {params}")
-            
             response = requests.get(url, params=params, timeout=10)
-            logger.debug(f"FMP Response Status: {response.status_code}")
-            logger.debug(f"FMP Response Headers: {response.headers}")
-            
+            logger.debug(f"FMP Status: {response.status_code}")
             response.raise_for_status()
             data = response.json()
-            logger.debug(f"FMP Response Data: {json.dumps(data)[:500]}")
             return data[0] if isinstance(data, list) and len(data) > 0 else data
         
         data = retry_with_backoff(fetch, max_retries=2)
@@ -193,41 +155,36 @@ def get_fmp_quote(ticker: str) -> Dict:
         return {}
     
     except Exception as e:
-        logger.error(f"FMP quote failed for {ticker}: {str(e)}", exc_info=True)
+        logger.error(f"FMP quote failed for {ticker}: {str(e)}")
         return {}
 
 @st.cache_data(ttl=86400)
 def get_fmp_profile(ticker: str) -> Dict:
     """Fetch company profile from FMP"""
     
-    if not FMP_API_KEY or FMP_API_KEY == "YOUR_FMP_API_KEY_HERE":
+    if not FMP_API_KEY:
         return {}
     
     try:
-        logger.info(f"[FMP PROFILE] Fetching for {ticker}")
+        logger.info(f"[FMP PROFILE] Fetching {ticker}")
         
         def fetch():
             url = f"{FMP_BASE_URL}/profile/{ticker}"
             params = {'apikey': FMP_API_KEY}
-            logger.debug(f"FMP Profile URL: {url}")
-            
             response = requests.get(url, params=params, timeout=10)
-            logger.debug(f"FMP Profile Response Status: {response.status_code}")
-            
             response.raise_for_status()
             data = response.json()
-            logger.debug(f"FMP Profile Response: {json.dumps(data)[:500]}")
             return data[0] if isinstance(data, list) and len(data) > 0 else data
         
         data = retry_with_backoff(fetch, max_retries=2)
         
         if data:
-            logger.info(f"✅ FMP profile for {ticker}")
+            logger.info(f"�� FMP profile for {ticker}")
             return data
         return {}
     
     except Exception as e:
-        logger.error(f"FMP profile failed for {ticker}: {str(e)}", exc_info=True)
+        logger.error(f"FMP profile failed for {ticker}: {str(e)}")
         return {}
 
 # ============================================================================
@@ -238,27 +195,20 @@ def get_fmp_profile(ticker: str) -> Dict:
 def get_eodhd_quote(ticker: str) -> Dict:
     """Fetch real-time quote from EODHD"""
     
-    if not EODHD_API_KEY or EODHD_API_KEY == "YOUR_EODHD_API_KEY_HERE":
-        logger.error(f"EODHD_API_KEY not configured or is placeholder")
+    if not EODHD_API_KEY:
+        logger.error("EODHD_API_KEY is empty")
         return {}
     
     try:
-        logger.info(f"[EODHD QUOTE] Fetching for {ticker}")
-        logger.debug(f"EODHD_API_KEY exists: {bool(EODHD_API_KEY)}, length: {len(EODHD_API_KEY) if EODHD_API_KEY else 0}")
+        logger.info(f"[EODHD QUOTE] Fetching {ticker}")
         
         def fetch():
             url = f"{EODHD_BASE_URL}/real-time/{ticker}.US"
             params = {'api_token': EODHD_API_KEY, 'fmt': 'json'}
-            logger.debug(f"EODHD URL: {url}")
-            logger.debug(f"EODHD Params: {params}")
-            
             response = requests.get(url, params=params, timeout=10)
-            logger.debug(f"EODHD Response Status: {response.status_code}")
-            
+            logger.debug(f"EODHD Status: {response.status_code}")
             response.raise_for_status()
-            data = response.json()
-            logger.debug(f"EODHD Response: {json.dumps(data)[:500]}")
-            return data
+            return response.json()
         
         data = retry_with_backoff(fetch, max_retries=2)
         
@@ -268,31 +218,25 @@ def get_eodhd_quote(ticker: str) -> Dict:
         return {}
     
     except Exception as e:
-        logger.error(f"EODHD quote failed for {ticker}: {str(e)}", exc_info=True)
+        logger.error(f"EODHD quote failed for {ticker}: {str(e)}")
         return {}
 
 @st.cache_data(ttl=86400)
 def get_eodhd_fundamentals(ticker: str) -> Dict:
     """Fetch fundamental data from EODHD"""
     
-    if not EODHD_API_KEY or EODHD_API_KEY == "YOUR_EODHD_API_KEY_HERE":
+    if not EODHD_API_KEY:
         return {}
     
     try:
-        logger.info(f"[EODHD FUNDAMENTALS] Fetching for {ticker}")
+        logger.info(f"[EODHD FUNDAMENTALS] Fetching {ticker}")
         
         def fetch():
             url = f"{EODHD_BASE_URL}/fundamentals/{ticker}.US"
             params = {'api_token': EODHD_API_KEY}
-            logger.debug(f"EODHD Fundamentals URL: {url}")
-            
             response = requests.get(url, params=params, timeout=10)
-            logger.debug(f"EODHD Fundamentals Response Status: {response.status_code}")
-            
             response.raise_for_status()
-            data = response.json()
-            logger.debug(f"EODHD Fundamentals Response: {json.dumps(data)[:500]}")
-            return data
+            return response.json()
         
         data = retry_with_backoff(fetch, max_retries=2)
         
@@ -302,7 +246,7 @@ def get_eodhd_fundamentals(ticker: str) -> Dict:
         return {}
     
     except Exception as e:
-        logger.error(f"EODHD fundamentals failed for {ticker}: {str(e)}", exc_info=True)
+        logger.error(f"EODHD fundamentals failed for {ticker}: {str(e)}")
         return {}
 
 # ============================================================================
@@ -311,7 +255,7 @@ def get_eodhd_fundamentals(ticker: str) -> Dict:
 
 @st.cache_data(ttl=3600)
 def get_enhanced_metrics(ticker: str) -> Dict:
-    """Fetch stock metrics with detailed diagnostics"""
+    """Fetch stock metrics - PRIMARY: FMP, FALLBACK: EODHD"""
     
     metrics = {
         'ticker': ticker,
@@ -325,34 +269,23 @@ def get_enhanced_metrics(ticker: str) -> Dict:
         'data_source': 'None'
     }
     
-    # Check if we have ANY keys configured
-    logger.info(f"=== STARTING METRICS FETCH FOR {ticker} ===")
-    logger.info(f"API Keys configured: FMP={bool(FMP_API_KEY)}, EODHD={bool(EODHD_API_KEY)}")
-    logger.info(f"API Keys source: {API_KEYS.get('source', 'UNKNOWN')}")
-    
     try:
         # PRIMARY: FMP
-        if FMP_API_KEY and FMP_API_KEY != "YOUR_FMP_API_KEY_HERE":
+        if FMP_API_KEY:
             try:
                 logger.info(f"[1/2] Trying FMP for {ticker}")
-                time.sleep(0.2)
+                time.sleep(0.1)
                 
                 fmp_quote = get_fmp_quote(ticker)
                 fmp_profile = get_fmp_profile(ticker)
                 
-                logger.debug(f"FMP Quote result: {fmp_quote}")
-                logger.debug(f"FMP Profile result: {fmp_profile}")
-                
-                if fmp_quote and 'error' not in fmp_quote:
-                    if fmp_quote.get('price'):
-                        metrics['price'] = round(float(fmp_quote.get('price')), 2)
-                        logger.info(f"✅ FMP Price for {ticker}: ${metrics['price']}")
+                if fmp_quote and fmp_quote.get('price'):
+                    metrics['price'] = round(float(fmp_quote.get('price')), 2)
+                    logger.info(f"✅ Got FMP price for {ticker}: ${metrics['price']}")
                     
                     if fmp_quote.get('pe'):
                         try:
-                            pe = float(fmp_quote.get('pe'))
-                            if pe and pe > 0:
-                                metrics['pe_ratio'] = round(pe, 2)
+                            metrics['pe_ratio'] = round(float(fmp_quote.get('pe')), 2)
                         except:
                             pass
                     
@@ -362,62 +295,76 @@ def get_enhanced_metrics(ticker: str) -> Dict:
                     if fmp_quote.get('yearLow'):
                         metrics['52_week_low'] = round(float(fmp_quote.get('yearLow')), 2)
                 
-                if fmp_profile and 'error' not in fmp_profile:
-                    if fmp_profile.get('mktCap'):
-                        market_cap = fmp_profile.get('mktCap')
-                        if market_cap >= 1e9:
-                            metrics['market_cap'] = f"${market_cap/1e9:.1f}B"
-                        elif market_cap >= 1e6:
-                            metrics['market_cap'] = f"${market_cap/1e6:.1f}M"
+                if fmp_profile and fmp_profile.get('mktCap'):
+                    market_cap = fmp_profile.get('mktCap')
+                    if market_cap >= 1e9:
+                        metrics['market_cap'] = f"${market_cap/1e9:.1f}B"
+                    elif market_cap >= 1e6:
+                        metrics['market_cap'] = f"${market_cap/1e6:.1f}M"
                 
                 if metrics['price'] != 'N/A':
                     metrics['data_source'] = 'FMP ✅'
-                    logger.info(f"✅✅✅ FMP SUCCESSFUL FOR {ticker} ✅✅✅")
+                    logger.info(f"✅✅✅ FMP SUCCESS for {ticker}")
                     return metrics
             
             except Exception as fmp_err:
-                logger.error(f"FMP Error: {str(fmp_err)}", exc_info=True)
+                logger.error(f"FMP Error: {str(fmp_err)}")
         else:
-            logger.warning(f"FMP_API_KEY not available: '{FMP_API_KEY}'")
+            logger.warning("FMP_API_KEY not available")
         
         # FALLBACK: EODHD
-        if EODHD_API_KEY and EODHD_API_KEY != "YOUR_EODHD_API_KEY_HERE":
+        if EODHD_API_KEY:
             try:
                 logger.info(f"[2/2] Trying EODHD for {ticker}")
-                time.sleep(0.2)
+                time.sleep(0.1)
                 
                 eodhd_quote = get_eodhd_quote(ticker)
                 eodhd_fund = get_eodhd_fundamentals(ticker)
                 
-                logger.debug(f"EODHD Quote result: {eodhd_quote}")
-                logger.debug(f"EODHD Fundamentals result: {eodhd_fund}")
-                
                 if eodhd_quote and eodhd_quote.get('close'):
                     metrics['price'] = round(float(eodhd_quote.get('close')), 2)
-                    logger.info(f"✅ EODHD Price for {ticker}: ${metrics['price']}")
+                    logger.info(f"✅ Got EODHD price for {ticker}: ${metrics['price']}")
                     
                     if eodhd_fund:
-                        if eodhd_fund.get('General', {}).get('52WeekHigh'):
-                            metrics['52_week_high'] = round(float(eodhd_fund['General']['52WeekHigh']), 2)
+                        general = eodhd_fund.get('General', {})
                         
-                        if eodhd_fund.get('General', {}).get('MarketCapitalization'):
-                            market_cap = eodhd_fund['General']['MarketCapitalization']
+                        if general.get('52WeekHigh'):
+                            metrics['52_week_high'] = round(float(general['52WeekHigh']), 2)
+                        
+                        if general.get('52WeekLow'):
+                            metrics['52_week_low'] = round(float(general['52WeekLow']), 2)
+                        
+                        if general.get('MarketCapitalization'):
+                            market_cap = general['MarketCapitalization']
                             if market_cap >= 1e9:
                                 metrics['market_cap'] = f"${market_cap/1e9:.1f}B"
                             elif market_cap >= 1e6:
                                 metrics['market_cap'] = f"${market_cap/1e6:.1f}M"
+                        
+                        highlights = eodhd_fund.get('Highlights', {})
+                        if highlights.get('DividendYield'):
+                            try:
+                                metrics['dividend_yield'] = round(float(highlights['DividendYield']) * 100, 2)
+                            except:
+                                pass
+                        
+                        if highlights.get('PERatio'):
+                            try:
+                                metrics['pe_ratio'] = round(float(highlights['PERatio']), 2)
+                            except:
+                                pass
                 
                 if metrics['price'] != 'N/A':
                     metrics['data_source'] = 'EODHD ✅'
-                    logger.info(f"✅✅✅ EODHD SUCCESSFUL FOR {ticker} ✅✅✅")
+                    logger.info(f"✅✅✅ EODHD SUCCESS for {ticker}")
                     return metrics
             
             except Exception as eodhd_err:
-                logger.error(f"EODHD Error: {str(eodhd_err)}", exc_info=True)
+                logger.error(f"EODHD Error: {str(eodhd_err)}")
         else:
-            logger.warning(f"EODHD_API_KEY not available: '{EODHD_API_KEY}'")
+            logger.warning("EODHD_API_KEY not available")
         
-        logger.error(f"❌❌❌ NO DATA SOURCES WORKED FOR {ticker} ❌❌❌")
+        logger.error(f"❌ NO DATA for {ticker}")
         metrics['data_source'] = 'No Data Available'
         return metrics
     
@@ -430,21 +377,18 @@ def get_enhanced_metrics(ticker: str) -> Dict:
 def get_company_info(ticker: str) -> Dict:
     """Fetch company information"""
     try:
-        if FMP_API_KEY and FMP_API_KEY != "YOUR_FMP_API_KEY_HERE":
-            try:
-                fmp_profile = get_fmp_profile(ticker)
-                if fmp_profile and fmp_profile.get('companyName'):
-                    return {
-                        'ticker': ticker,
-                        'name': fmp_profile.get('companyName', ticker),
-                        'sector': fmp_profile.get('sector', 'Unknown'),
-                        'industry': fmp_profile.get('industry', 'Unknown'),
-                        'market_cap': 'N/A',
-                        'category': TICKER_CATEGORIES.get(ticker, 'Unknown'),
-                        'data_source': 'FMP'
-                    }
-            except Exception as e:
-                logger.debug(f"FMP company info failed: {e}")
+        if FMP_API_KEY:
+            fmp_profile = get_fmp_profile(ticker)
+            if fmp_profile and fmp_profile.get('companyName'):
+                return {
+                    'ticker': ticker,
+                    'name': fmp_profile.get('companyName', ticker),
+                    'sector': fmp_profile.get('sector', 'Unknown'),
+                    'industry': fmp_profile.get('industry', 'Unknown'),
+                    'market_cap': 'N/A',
+                    'category': TICKER_CATEGORIES.get(ticker, 'Unknown'),
+                    'data_source': 'FMP'
+                }
         
         return {
             'ticker': ticker,
@@ -472,10 +416,7 @@ def get_company_info(ticker: str) -> Dict:
 def get_cape_ratio_approximation() -> Dict:
     """Fetch CAPE ratio from FRED API"""
     
-    cape_data = {
-        'cape_ratio': 'N/A',
-        'cape_date': 'N/A',
-    }
+    cape_data = {'cape_ratio': 'N/A', 'cape_date': 'N/A'}
     
     if not FRED_API_KEY:
         return cape_data
@@ -494,16 +435,16 @@ def get_cape_ratio_approximation() -> Dict:
                     cape_data['cape_date'] = obs.get('date', 'N/A')
     
     except Exception as e:
-        logger.debug(f"Error fetching CAPE ratio: {str(e)}")
+        logger.debug(f"Error fetching CAPE: {str(e)}")
     
     return cape_data
 
 # ============================================================================
-# WEB CRAWLING (unchanged)
+# WEB CRAWLING
 # ============================================================================
 
 def crawl_news_feeds() -> List[Dict]:
-    """Crawl RSS feeds from major financial news sources"""
+    """Crawl RSS feeds"""
     articles = []
     
     for source_name, feed_url in NEWS_SOURCES.items():
@@ -515,7 +456,7 @@ def crawl_news_feeds() -> List[Dict]:
             try:
                 root = ET.fromstring(response.content)
             except ET.ParseError:
-                logger.warning(f"Failed to parse XML from {source_name}")
+                logger.warning(f"Failed to parse {source_name}")
                 continue
             
             items = root.findall('.//item')
@@ -527,80 +468,46 @@ def crawl_news_feeds() -> List[Dict]:
                     title_elem = item.find('title')
                     if title_elem is None:
                         title_elem = item.find('{http://www.w3.org/2005/Atom}title')
-                    title = title_elem.text if title_elem is not None and title_elem.text else 'N/A'
+                    title = title_elem.text if title_elem is not None else 'N/A'
                     
                     link_elem = item.find('link')
                     if link_elem is None:
                         link_elem = item.find('{http://www.w3.org/2005/Atom}link')
                     
+                    link = ''
                     if link_elem is not None:
                         link = link_elem.get('href') if link_elem.get('href') else link_elem.text
-                    else:
-                        link = ''
                     
                     pub_elem = item.find('pubDate')
                     if pub_elem is None:
                         pub_elem = item.find('{http://www.w3.org/2005/Atom}published')
-                    published = pub_elem.text if pub_elem is not None and pub_elem.text else datetime.now().isoformat()
+                    published = pub_elem.text if pub_elem is not None else datetime.now().isoformat()
                     
                     summary_elem = item.find('description')
                     if summary_elem is None:
                         summary_elem = item.find('{http://www.w3.org/2005/Atom}summary')
-                    summary = summary_elem.text if summary_elem is not None and summary_elem.text else ''
+                    summary = summary_elem.text if summary_elem is not None else ''
                     summary = re.sub('<[^<]+?>', '', summary)[:500]
                     
-                    article = {
+                    articles.append({
                         'source': source_name,
                         'title': title,
                         'link': link,
                         'published': published,
                         'summary': summary,
                         'crawled_at': datetime.now().isoformat()
-                    }
-                    articles.append(article)
+                    })
                 
                 except Exception as e:
-                    logger.debug(f"Error parsing item from {source_name}: {str(e)}")
-                    continue
+                    logger.debug(f"Error parsing item: {str(e)}")
         
         except Exception as e:
             logger.warning(f"Error crawling {source_name}: {str(e)}")
     
     return articles
 
-def crawl_sec_filings(company_tickers: List[str]) -> List[Dict]:
-    """Crawl SEC filings"""
-    filings = []
-    
-    for ticker in company_tickers:
-        try:
-            params = {
-                'action': 'getcompany',
-                'CIK': ticker,
-                'type': '10-K|10-Q|8-K',
-                'owner': 'exclude',
-                'count': 40,
-                'output': 'json'
-            }
-            
-            response = requests.get(SEC_FILINGS_API, params=params, timeout=10)
-            response.raise_for_status()
-            
-            data = response.json()
-            for filing in data.get('filings', {}).get('recent', {}).get('filings', [])[:5]:
-                filings.append({
-                    'ticker': ticker,
-                    'filing_type': filing.get('form'),
-                    'filed_date': filing.get('filingDate'),
-                })
-        
-        except Exception as e:
-            logger.warning(f"Error crawling SEC filings for {ticker}: {str(e)}")
-    
-    return filings
-
 def extract_stock_mentions(articles: List[Dict]) -> Dict[str, List]:
-    """Extract stock tickers from crawled articles"""
+    """Extract stock tickers from articles"""
     stock_mentions = {}
     
     for article in articles:
@@ -614,63 +521,57 @@ def extract_stock_mentions(articles: List[Dict]) -> Dict[str, List]:
     return stock_mentions
 
 def get_stock_fundamentals(ticker: str) -> Dict:
-    """Fetch stock fundamentals"""
+    """Fetch fundamentals"""
     try:
-        if FMP_API_KEY and FMP_API_KEY != "YOUR_FMP_API_KEY_HERE":
-            fmp_profile = get_fmp_profile(ticker)
-            if fmp_profile:
-                return fmp_profile
+        if FMP_API_KEY:
+            return get_fmp_profile(ticker) or {}
         return {}
     except Exception as e:
-        logger.debug(f"Error fetching fundamentals for {ticker}: {str(e)}")
+        logger.debug(f"Error fetching fundamentals: {str(e)}")
         return {}
 
 def calculate_confidence_score(ticker: str, articles: List[Dict], fundamentals: Dict, category: str) -> Tuple[float, str]:
-    """Calculate confidence score"""
+    """Calculate confidence"""
     confidence = 0.5
     factors = []
     
     article_count = len(articles)
     if article_count >= 5:
         confidence += 0.15
-        factors.append(f"Strong media coverage ({article_count} articles)")
+        factors.append(f"Strong coverage ({article_count} articles)")
     elif article_count >= 3:
         confidence += 0.10
-        factors.append(f"Moderate media coverage ({article_count} articles)")
-    else:
-        factors.append(f"Limited media coverage ({article_count} articles)")
+        factors.append(f"Moderate coverage ({article_count} articles)")
     
     if category == 'Large-Cap':
         confidence += 0.10
-        factors.append("Large-cap company")
-    elif category == 'Mid-Cap':
-        confidence += 0.05
-        factors.append("Mid-cap company")
+    elif category == 'ETF':
+        confidence += 0.10
     
-    confidence = min(confidence, 0.95)
-    confidence = max(confidence, 0.50)
+    confidence = min(0.95, max(0.50, confidence))
+    justification = ". ".join(factors) + "." if factors else "Stock mentioned in news"
     
-    justification = ". ".join(factors) + "."
     return confidence, justification
 
 def generate_template_explanation(ticker: str, company_name: str, articles: List[Dict], fundamentals: Dict) -> str:
     """Generate explanation"""
+    recent_news = articles[0]['title'] if articles else "Recent market developments"
+    
     return f"""
 ## Investment Thesis: {company_name} ({ticker})
 
 ### 12-24 Month Positive Outlook
+{company_name} presents a compelling investment opportunity. Recent news: {recent_news}
 
-{company_name} presents a compelling investment opportunity with significant upside potential over the next 12-24 months.
+### Growth Catalysts
+1. Market expansion opportunities
+2. Operational efficiency improvements
+3. Strategic positioning in growth markets
 
-### Growth Catalysts and Drivers
+### Why Now
+Market volatility creates attractive entry points for long-term investors.
 
-Several key catalysts position {company_name} for outperformance
-
-### Why Now is the Right Entry Point
-
-Current valuation levels present an attractive risk-reward opportunity.
-
-**Rating: BUY | Target Horizon: 12-24 months | Risk Level: Moderate**
+**Rating: BUY | Horizon: 12-24 months | Risk: Moderate**
 """
 
 def generate_recommendation(ticker: str, articles: List[Dict], fundamentals: Dict) -> Dict:
@@ -697,7 +598,7 @@ def generate_recommendation(ticker: str, articles: List[Dict], fundamentals: Dic
     }
 
 def generate_recommendations(crawled_articles: List[Dict], num_recommendations: int = 5) -> List[Dict]:
-    """Generate top N recommendations"""
+    """Generate recommendations"""
     stock_mentions = extract_stock_mentions(crawled_articles)
     top_tickers = sorted(stock_mentions.items(), key=lambda x: len(x[1]), reverse=True)[:num_recommendations]
     
@@ -713,52 +614,6 @@ def generate_recommendations(crawled_articles: List[Dict], num_recommendations: 
 # STREAMLIT UI
 # ============================================================================
 
-def render_recommendation_card(rec: Dict):
-    """Render recommendation card"""
-    col1, col2 = st.columns([3, 1])
-    
-    with col1:
-        st.markdown(f"## {rec['ticker']} - {rec['company_name']}")
-        st.markdown(f"**Category:** {rec['category']} | **Sector:** {rec['sector']}")
-    
-    with col2:
-        st.metric("Confidence", f"{rec['confidence_score']:.0%}")
-    
-    st.info(f"📊 {rec['confidence_justification']}")
-    st.markdown(rec['explanation'])
-
-def render_crawl_status(articles: List[Dict]):
-    """Render crawl status"""
-    col1, col2, col3, col4 = st.columns(4)
-    with col1:
-        st.metric("Articles", len(articles))
-    with col2:
-        st.metric("Sources", len(set(a['source'] for a in articles)))
-
-def render_analytics_dashboard(articles: List[Dict], recommendations: List[Dict]):
-    """Render analytics"""
-    st.subheader("📊 Analytics")
-    
-    if articles:
-        mentions = extract_stock_mentions(articles)
-        
-        ticker_data = []
-        for idx, ticker in enumerate(sorted(mentions.keys())):
-            metrics = get_enhanced_metrics(ticker)
-            company_info = get_company_info(ticker)
-            
-            ticker_data.append({
-                'Ticker': ticker,
-                'Company': company_info.get('name', ticker)[:20],
-                'Price': metrics.get('price', 'N/A'),
-                'P/E': metrics.get('pe_ratio', 'N/A'),
-                'Market Cap': metrics.get('market_cap', 'N/A'),
-                'Source': metrics.get('data_source', 'N/A')
-            })
-        
-        if ticker_data:
-            st.dataframe(pd.DataFrame(ticker_data), use_container_width=True)
-
 def main():
     """Main app"""
     init_session()
@@ -766,34 +621,29 @@ def main():
     st.title("📈 Stock Recommendation Engine")
     st.markdown("Using FMP & EODHD APIs")
     
-    # Display API Configuration Status
     with st.sidebar:
-        st.header("🔧 API Configuration")
-        st.subheader("Configuration Source")
-        st.info(f"Loading from: **{API_KEYS.get('source', 'UNKNOWN')}**")
+        st.header("🔧 API Status")
         
-        st.subheader("API Keys Status")
-        
-        if FMP_API_KEY and FMP_API_KEY != "YOUR_FMP_API_KEY_HERE":
-            st.success(f"✅ FMP Configured (key length: {len(FMP_API_KEY)})")
+        if FMP_API_KEY:
+            st.success(f"✅ FMP Configured")
         else:
-            st.error(f"❌ FMP Not Configured: '{FMP_API_KEY[:50]}...'")
+            st.error(f"❌ FMP Missing")
         
-        if EODHD_API_KEY and EODHD_API_KEY != "YOUR_EODHD_API_KEY_HERE":
-            st.success(f"✅ EODHD Configured (key length: {len(EODHD_API_KEY)})")
+        if EODHD_API_KEY:
+            st.success(f"✅ EODHD Configured")
         else:
-            st.error(f"❌ EODHD Not Configured: '{EODHD_API_KEY[:50]}...'")
+            st.error(f"❌ EODHD Missing")
         
         if FRED_API_KEY:
             st.success(f"✅ FRED Configured")
         else:
-            st.warning(f"⚠️ FRED Not Configured")
+            st.warning(f"⚠️ FRED Optional")
         
         st.divider()
         st.header("⚙️ Controls")
         
-        if st.button("🔄 Run Web Crawler Now", use_container_width=True):
-            with st.spinner("Crawling financial sources..."):
+        if st.button("🔄 Run Web Crawler", use_container_width=True):
+            with st.spinner("Crawling..."):
                 articles = crawl_news_feeds()
                 st.session_state.crawled_articles = articles
                 st.session_state.last_crawl = datetime.now()
@@ -801,57 +651,59 @@ def main():
         
         if st.button("📊 Generate Recommendations", use_container_width=True):
             if not hasattr(st.session_state, 'crawled_articles') or not st.session_state.crawled_articles:
-                st.warning("Please run crawler first")
+                st.warning("Run crawler first")
             else:
-                with st.spinner("Generating recommendations..."):
+                with st.spinner("Generating..."):
                     recommendations = generate_recommendations(st.session_state.crawled_articles)
                     st.session_state.recommendations = recommendations
-                    st.success("✅ Recommendations generated")
+                    st.success("✅ Generated")
         
         st.divider()
-        st.markdown("### 🧪 Debug Tools")
+        st.markdown("### 🧪 Debug")
         test_ticker = st.text_input("Test ticker:", value="AAPL")
-        if st.button("📍 Test Single Ticker", use_container_width=True):
-            st.info(f"Testing {test_ticker} with FMP & EODHD...")
-            with st.spinner("Fetching data..."):
-                test_metrics = get_enhanced_metrics(test_ticker)
-                st.write("**Metrics Retrieved:**")
-                st.json(test_metrics)
+        if st.button("📍 Test Ticker"):
+            with st.spinner(f"Testing {test_ticker}..."):
+                metrics = get_enhanced_metrics(test_ticker)
+                st.json(metrics)
         
-        if st.button("🗑️ Clear Cache", use_container_width=True):
+        if st.button("🗑️ Clear Cache"):
             clear_cache()
-            st.success("Cache cleared!")
+            st.success("Cleared!")
     
-    # Main content
-    has_crawl_data = hasattr(st.session_state, 'last_crawl') and st.session_state.last_crawl is not None
+    has_crawl = hasattr(st.session_state, 'last_crawl') and st.session_state.last_crawl is not None
     
-    if has_crawl_data:
-        tab1, tab2, tab3 = st.tabs(["📋 Recommendations", "📰 Crawl Data", "📊 Analytics"])
+    if has_crawl:
+        tab1, tab2, tab3 = st.tabs(["Recommendations", "Articles", "Analytics"])
         
         with tab1:
-            has_recommendations = hasattr(st.session_state, 'recommendations') and st.session_state.recommendations
-            if has_recommendations:
-                st.subheader("Recommendations")
+            if hasattr(st.session_state, 'recommendations') and st.session_state.recommendations:
                 for i, rec in enumerate(st.session_state.recommendations[:5], 1):
-                    st.markdown(f"### #{i} - {rec['company_name']} ({rec['ticker']})")
-                    render_recommendation_card(rec)
+                    st.markdown(f"### #{i} {rec['ticker']} - {rec['company_name']}")
+                    st.metric("Confidence", f"{rec['confidence_score']:.0%}")
+                    st.markdown(rec['explanation'])
             else:
-                st.info("Click 'Generate Recommendations'")
+                st.info("Generate recommendations")
         
         with tab2:
             if hasattr(st.session_state, 'crawled_articles') and st.session_state.crawled_articles:
-                render_crawl_status(st.session_state.crawled_articles)
-                articles_df = pd.DataFrame(st.session_state.crawled_articles)
-                st.dataframe(articles_df[['source', 'title']].head(20), use_container_width=True)
+                st.dataframe(pd.DataFrame(st.session_state.crawled_articles)[['source', 'title']], use_container_width=True)
         
         with tab3:
             if hasattr(st.session_state, 'crawled_articles') and st.session_state.crawled_articles:
-                render_analytics_dashboard(
-                    st.session_state.crawled_articles,
-                    st.session_state.recommendations if hasattr(st.session_state, 'recommendations') else []
-                )
+                mentions = extract_stock_mentions(st.session_state.crawled_articles)
+                ticker_data = []
+                for ticker in sorted(mentions.keys()):
+                    metrics = get_enhanced_metrics(ticker)
+                    ticker_data.append({
+                        'Ticker': ticker,
+                        'Price': metrics.get('price'),
+                        'P/E': metrics.get('pe_ratio'),
+                        'Market Cap': metrics.get('market_cap'),
+                        'Source': metrics.get('data_source')
+                    })
+                st.dataframe(pd.DataFrame(ticker_data), use_container_width=True)
     else:
-        st.info("👈 Start by running the web crawler")
+        st.info("👈 Run crawler first")
 
 if __name__ == "__main__":
     main()
