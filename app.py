@@ -11,8 +11,9 @@ from typing import List, Dict, Tuple
 import json
 import os
 from functools import lru_cache
-import feedparser
 import logging
+import xml.etree.ElementTree as ET
+import re
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -64,6 +65,7 @@ def init_session():
 def crawl_news_feeds() -> List[Dict]:
     """
     Crawl RSS feeds from major financial news sources
+    Uses XML parsing instead of feedparser for Python 3.13 compatibility
     
     Returns:
         List of article dictionaries with metadata
@@ -73,24 +75,84 @@ def crawl_news_feeds() -> List[Dict]:
     for source_name, feed_url in NEWS_SOURCES.items():
         try:
             logger.info(f"Crawling {source_name}...")
-            feed = feedparser.parse(feed_url)
+            
+            # Fetch the RSS feed
+            response = requests.get(feed_url, timeout=10)
+            response.raise_for_status()
+            
+            # Parse XML
+            try:
+                root = ET.fromstring(response.content)
+            except ET.ParseError:
+                logger.warning(f"Failed to parse XML from {source_name}")
+                continue
             
             # Get articles from last 24 hours
             cutoff_time = datetime.now() - timedelta(days=1)
             
-            for entry in feed.entries[:50]:  # Limit to 50 most recent
-                published = datetime(*entry.published_parsed[:6]) if hasattr(entry, 'published_parsed') else datetime.now()
-                
-                if published > cutoff_time:
+            # Find all items/entries (handle both RSS and Atom formats)
+            items = root.findall('.//item')
+            if not items:
+                items = root.findall('.//{http://www.w3.org/2005/Atom}entry')
+            
+            for item in items[:50]:  # Limit to 50 most recent
+                try:
+                    # Extract fields - try multiple possible tag names
+                    title = None
+                    link = None
+                    published = None
+                    summary = None
+                    
+                    # Title
+                    title_elem = item.find('title')
+                    if title_elem is None:
+                        title_elem = item.find('{http://www.w3.org/2005/Atom}title')
+                    title = title_elem.text if title_elem is not None and title_elem.text else 'N/A'
+                    
+                    # Link
+                    link_elem = item.find('link')
+                    if link_elem is None:
+                        link_elem = item.find('{http://www.w3.org/2005/Atom}link')
+                    
+                    if link_elem is not None:
+                        # For Atom, link is an attribute
+                        if link_elem.get('href'):
+                            link = link_elem.get('href')
+                        else:
+                            link = link_elem.text
+                    else:
+                        link = ''
+                    
+                    # Published date
+                    pub_elem = item.find('pubDate')
+                    if pub_elem is None:
+                        pub_elem = item.find('{http://www.w3.org/2005/Atom}published')
+                    
+                    published = pub_elem.text if pub_elem is not None and pub_elem.text else datetime.now().isoformat()
+                    
+                    # Summary/Description
+                    summary_elem = item.find('description')
+                    if summary_elem is None:
+                        summary_elem = item.find('{http://www.w3.org/2005/Atom}summary')
+                    
+                    summary = summary_elem.text if summary_elem is not None and summary_elem.text else ''
+                    
+                    # Clean HTML tags from summary
+                    summary = re.sub('<[^<]+?>', '', summary)[:500]
+                    
                     article = {
                         'source': source_name,
-                        'title': entry.get('title', 'N/A'),
-                        'link': entry.get('link', ''),
-                        'published': published.isoformat(),
-                        'summary': entry.get('summary', '')[:500],
+                        'title': title,
+                        'link': link,
+                        'published': published,
+                        'summary': summary,
                         'crawled_at': datetime.now().isoformat()
                     }
                     articles.append(article)
+                
+                except Exception as e:
+                    logger.debug(f"Error parsing item from {source_name}: {str(e)}")
+                    continue
         
         except Exception as e:
             logger.warning(f"Error crawling {source_name}: {str(e)}")
