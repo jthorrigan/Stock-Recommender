@@ -44,6 +44,22 @@ SEC_FILINGS_API = "https://www.sec.gov/cgi-bin/browse-edgar"
 ALPHA_VANTAGE_API_KEY = os.getenv("ALPHA_VANTAGE_API_KEY", "demo")
 HF_API_KEY = os.getenv("HF_API_KEY", "")
 
+# Expanded ticker list - Large-cap, Mid-cap, Small-cap, and ETFs
+STOCK_TICKERS = {
+    'Large-Cap': ['AAPL', 'MSFT', 'GOOGL', 'AMZN', 'TSLA', 'META', 'NVDA', 'JPM', 'BAC', 'WMT'],
+    'Mid-Cap': ['CRWD', 'DDOG', 'CRM', 'ZS', 'OKTA', 'SNOW', 'SSNC', 'TTD', 'NET', 'MSTR'],
+    'Small-Cap': ['UPST', 'NXTC', 'BREX', 'DASH', 'COIN', 'HOOD', 'RBLX', 'PLTR', 'SOFI', 'GDS'],
+    'ETF': ['SPY', 'QQQ', 'IWM', 'XLK', 'XLV', 'XLF', 'XLE', 'ARKK', 'VTSAX', 'VGIT']
+}
+
+# Flatten for searching
+ALL_TICKERS = []
+TICKER_CATEGORIES = {}
+for category, tickers in STOCK_TICKERS.items():
+    ALL_TICKERS.extend(tickers)
+    for ticker in tickers:
+        TICKER_CATEGORIES[ticker] = category
+
 # ============================================================================
 # CACHING & SESSION STATE
 # ============================================================================
@@ -87,6 +103,12 @@ def get_company_info(ticker: str) -> Dict:
             data = response.json()
             
             if 'Name' in data:
+                market_cap = data.get('MarketCapitalization', '0')
+                try:
+                    market_cap_num = int(market_cap) if market_cap else 0
+                except:
+                    market_cap_num = 0
+                
                 return {
                     'ticker': ticker,
                     'name': data.get('Name', ticker),
@@ -95,26 +117,20 @@ def get_company_info(ticker: str) -> Dict:
                     'description': data.get('Description', ''),
                     'pe_ratio': data.get('PERatio', 'N/A'),
                     'dividend_yield': data.get('DividendYield', 'N/A'),
-                    'market_cap': data.get('MarketCapitalization', 'N/A'),
+                    'market_cap': market_cap,
+                    'market_cap_numeric': market_cap_num,
+                    'category': TICKER_CATEGORIES.get(ticker, 'Unknown')
                 }
         
-        # Fallback: use ticker lookup service
-        response = requests.get(f'https://api.example.com/stock/{ticker}', timeout=5)
-        if response.status_code == 200:
-            data = response.json()
-            return {
-                'ticker': ticker,
-                'name': data.get('name', ticker),
-                'sector': data.get('sector', 'Unknown'),
-                'industry': data.get('industry', 'Unknown'),
-            }
-        
-        # Final fallback
+        # Fallback
         return {
             'ticker': ticker,
             'name': ticker,
             'sector': 'Unknown',
             'industry': 'Unknown',
+            'market_cap': 'Unknown',
+            'market_cap_numeric': 0,
+            'category': TICKER_CATEGORIES.get(ticker, 'Unknown')
         }
     
     except Exception as e:
@@ -124,6 +140,9 @@ def get_company_info(ticker: str) -> Dict:
             'name': ticker,
             'sector': 'Unknown',
             'industry': 'Unknown',
+            'market_cap': 'Unknown',
+            'market_cap_numeric': 0,
+            'category': TICKER_CATEGORIES.get(ticker, 'Unknown')
         }
 
 # ============================================================================
@@ -273,6 +292,7 @@ def crawl_sec_filings(company_tickers: List[str]) -> List[Dict]:
 def extract_stock_mentions(articles: List[Dict]) -> Dict[str, List]:
     """
     Extract stock tickers and sentiment from crawled articles
+    Includes large-cap, mid-cap, small-cap stocks and ETFs
     
     Args:
         articles: List of crawled articles
@@ -282,12 +302,9 @@ def extract_stock_mentions(articles: List[Dict]) -> Dict[str, List]:
     """
     stock_mentions = {}
     
-    # Simple extraction - in production, use NER model
-    common_tickers = ['AAPL', 'MSFT', 'GOOGL', 'AMZN', 'TSLA', 'META', 'NVDA', 'JPM', 'BAC', 'WMT']
-    
     for article in articles:
         text = f"{article['title']} {article['summary']}".upper()
-        for ticker in common_tickers:
+        for ticker in ALL_TICKERS:
             if ticker in text:
                 if ticker not in stock_mentions:
                     stock_mentions[ticker] = []
@@ -321,6 +338,68 @@ def get_stock_fundamentals(ticker: str) -> Dict:
     except Exception as e:
         logger.warning(f"Error fetching fundamentals for {ticker}: {str(e)}")
         return {}
+
+def calculate_confidence_score(ticker: str, articles: List[Dict], fundamentals: Dict, category: str) -> Tuple[float, str]:
+    """
+    Calculate confidence score and justification
+    
+    Args:
+        ticker: Stock ticker
+        articles: Related articles
+        fundamentals: Stock fundamentals
+        category: Stock category (Large-Cap, Mid-Cap, Small-Cap, ETF)
+    
+    Returns:
+        Tuple of (confidence_score, justification_text)
+    """
+    
+    confidence = 0.5  # Base confidence
+    factors = []
+    
+    # Article count factor
+    article_count = len(articles)
+    if article_count >= 5:
+        confidence += 0.15
+        factors.append(f"Strong media coverage ({article_count} articles)")
+    elif article_count >= 3:
+        confidence += 0.10
+        factors.append(f"Moderate media coverage ({article_count} articles)")
+    else:
+        factors.append(f"Limited media coverage ({article_count} articles)")
+    
+    # Category factor
+    if category == 'Large-Cap':
+        confidence += 0.10
+        factors.append("Established large-cap company with proven track record")
+    elif category == 'Mid-Cap':
+        confidence += 0.05
+        factors.append("Growing mid-cap with emerging opportunities")
+    elif category == 'Small-Cap':
+        confidence += 0.00
+        factors.append("Small-cap with higher growth potential but more volatility")
+    elif category == 'ETF':
+        confidence += 0.10
+        factors.append("Diversified ETF reduces individual stock risk")
+    
+    # Fundamentals factor
+    if fundamentals.get('PERatio') and fundamentals.get('PERatio') != 'None':
+        try:
+            pe_ratio = float(fundamentals.get('PERatio', 0))
+            if 10 < pe_ratio < 30:
+                confidence += 0.10
+                factors.append("Reasonable valuation metrics")
+            elif pe_ratio > 0:
+                factors.append(f"High valuation (P/E: {pe_ratio:.1f})")
+        except:
+            pass
+    
+    # Cap at 0.95 max
+    confidence = min(confidence, 0.95)
+    confidence = max(confidence, 0.50)
+    
+    justification = ". ".join(factors) + "."
+    
+    return confidence, justification
 
 def generate_explanation_with_free_ai(
     ticker: str,
@@ -502,6 +581,12 @@ def generate_recommendation(
     # Get company info
     company_info = get_company_info(ticker)
     company_name = company_info.get('name', ticker)
+    category = company_info.get('category', 'Unknown')
+    
+    # Calculate confidence score
+    confidence_score, confidence_justification = calculate_confidence_score(
+        ticker, articles, fundamentals, category
+    )
     
     # Generate detailed explanation
     explanation = generate_explanation_with_free_ai(
@@ -515,12 +600,15 @@ def generate_recommendation(
         'ticker': ticker,
         'company_name': company_name,
         'sector': company_info.get('sector', 'Unknown'),
+        'category': category,
+        'market_cap': company_info.get('market_cap', 'Unknown'),
         'recommendation_date': datetime.now().isoformat(),
         'rating': 'BUY',
         'price_target': fundamentals.get('PERatio', 'TBD'),
         'explanation': explanation,
         'sources': articles[:5],
-        'confidence_score': 0.75,
+        'confidence_score': confidence_score,
+        'confidence_justification': confidence_justification,
         'risk_factors': [
             'Market volatility',
             'Competitive pressures',
@@ -575,10 +663,13 @@ def render_recommendation_card(rec: Dict):
     
     with col1:
         st.markdown(f"## {rec['ticker']} - {rec['company_name']}")
-        st.markdown(f"**Sector:** {rec['sector']} | **Rating:** {rec['rating']} | **Confidence:** {rec['confidence_score']:.0%}")
+        st.markdown(f"**Category:** {rec['category']} | **Sector:** {rec['sector']} | **Rating:** {rec['rating']}")
     
     with col2:
         st.metric("Confidence", f"{rec['confidence_score']:.0%}")
+    
+    # Confidence justification
+    st.info(f"📊 **Confidence Rationale:** {rec['confidence_justification']}")
     
     st.markdown("---")
     
@@ -618,7 +709,7 @@ def render_crawl_status(articles: List[Dict]):
     
     with col2:
         sources = len(set(a['source'] for a in articles))
-        st.metric("Sources", sources)
+        st.metric("News Sources", sources)
     
     with col3:
         if articles:
@@ -628,6 +719,129 @@ def render_crawl_status(articles: List[Dict]):
     with col4:
         st.metric("Update Status", "✅ Current" if articles else "⚠️ Pending")
 
+def render_analytics_dashboard(articles: List[Dict], recommendations: List[Dict]):
+    """Render comprehensive analytics dashboard"""
+    
+    st.subheader("📊 Analytics Dashboard")
+    
+    # Top row: Key metrics
+    col1, col2, col3, col4 = st.columns(4)
+    with col1:
+        st.metric("Total Tickers Mentioned", len(extract_stock_mentions(articles)))
+    with col2:
+        st.metric("Avg Recommendation Confidence", f"{(sum(r['confidence_score'] for r in recommendations) / len(recommendations) * 100):.0f}%" if recommendations else "N/A")
+    with col3:
+        st.metric("Market Cap Range", "Large to Micro")
+    with col4:
+        st.metric("Asset Types", "Stocks & ETFs")
+    
+    st.markdown("---")
+    
+    # Stock mentions by category
+    st.markdown("### 📈 Stock Mentions by Market Cap Category")
+    
+    if articles:
+        mentions = extract_stock_mentions(articles)
+        
+        # Categorize mentions
+        category_data = {
+            'Large-Cap': 0,
+            'Mid-Cap': 0,
+            'Small-Cap': 0,
+            'ETF': 0
+        }
+        
+        ticker_mentions = []
+        for ticker, articles_list in mentions.items():
+            category = TICKER_CATEGORIES.get(ticker, 'Unknown')
+            if category in category_data:
+                category_data[category] += len(articles_list)
+            ticker_mentions.append({
+                'Ticker': ticker,
+                'Mentions': len(articles_list),
+                'Category': category
+            })
+        
+        # Category pie chart
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            st.markdown("**Mentions by Category**")
+            category_df = pd.DataFrame(
+                list(category_data.items()),
+                columns=['Category', 'Mentions']
+            ).sort_values('Mentions', ascending=False)
+            
+            fig = st.bar_chart(
+                category_df.set_index('Category'),
+                use_container_width=True,
+                height=300
+            )
+            st.markdown("*Chart shows article mentions by company category*")
+        
+        with col2:
+            st.markdown("**Top 10 Mentioned Tickers**")
+            top_tickers_df = pd.DataFrame(ticker_mentions).sort_values('Mentions', ascending=False).head(10)
+            
+            fig = st.bar_chart(
+                top_tickers_df.set_index('Ticker')['Mentions'],
+                use_container_width=True,
+                height=300
+            )
+            st.markdown("*Chart shows most frequently mentioned stocks in news*")
+        
+        st.markdown("---")
+        
+        # Detailed ticker table
+        st.markdown("### 📋 Detailed Ticker Mentions")
+        
+        detailed_df = pd.DataFrame(ticker_mentions).sort_values('Mentions', ascending=False)
+        detailed_df['Mentions'] = detailed_df['Mentions'].astype(int)
+        
+        st.dataframe(
+            detailed_df,
+            use_container_width=True,
+            hide_index=True,
+            column_config={
+                'Ticker': st.column_config.TextColumn('Stock Ticker'),
+                'Mentions': st.column_config.NumberColumn('Article Mentions', format='%d'),
+                'Category': st.column_config.TextColumn('Market Cap Category')
+            }
+        )
+    
+    else:
+        st.info("Run the web crawler to see analytics data")
+    
+    st.markdown("---")
+    
+    # Recommendations summary
+    if recommendations:
+        st.markdown("### 🎯 Recommendations Summary")
+        
+        rec_df = pd.DataFrame([
+            {
+                'Ticker': r['ticker'],
+                'Company': r['company_name'],
+                'Category': r['category'],
+                'Confidence': f"{r['confidence_score']:.0%}",
+                'Sector': r['sector']
+            }
+            for r in recommendations
+        ])
+        
+        st.dataframe(
+            rec_df,
+            use_container_width=True,
+            hide_index=True,
+            column_config={
+                'Ticker': st.column_config.TextColumn('Symbol'),
+                'Company': st.column_config.TextColumn('Company Name'),
+                'Category': st.column_config.TextColumn('Market Cap'),
+                'Confidence': st.column_config.TextColumn('Confidence Level'),
+                'Sector': st.column_config.TextColumn('Sector')
+            }
+        )
+
 def main():
     """Main Streamlit application"""
     
@@ -636,7 +850,7 @@ def main():
     
     # Header
     st.title("📈 Stock Recommendation Engine")
-    st.markdown("AI-powered daily stock recommendations based on web crawl analysis")
+    st.markdown("AI-powered daily stock recommendations based on web crawl analysis | Large-Cap, Mid-Cap, Small-Cap, & ETFs")
     
     # Sidebar controls
     with st.sidebar:
@@ -674,11 +888,17 @@ def main():
         with st.expander("ℹ️ About"):
             st.markdown("""
             This app:
-            1. Crawls financial news, SEC filings, and company reports daily
-            2. Extracts stock mentions and sentiment
-            3. Analyzes fundamentals and market timing
-            4. Recommends top 5 stocks with detailed explanations
-            5. Links to original sources for verification
+            1. Crawls financial news from 6+ major sources daily
+            2. Analyzes coverage across all market cap categories
+            3. Extracts stock & ETF mentions with sentiment analysis
+            4. Analyzes fundamentals and market timing
+            5. Generates recommendations with source links
+            
+            **Coverage:**
+            - Large-Cap stocks (AAPL, MSFT, GOOGL, etc.)
+            - Mid-Cap growth companies (CRWD, DDOG, etc.)
+            - Small-Cap emerging companies (UPST, BREX, etc.)
+            - ETFs (SPY, QQQ, sector ETFs, etc.)
             """)
         
         with st.expander("🔑 API Configuration"):
@@ -719,25 +939,19 @@ def main():
                 st.dataframe(
                     articles_df[['source', 'title', 'published']].head(20),
                     use_container_width=True,
-                    hide_index=True
+                    hide_index=True,
+                    column_config={
+                        'source': st.column_config.TextColumn('News Source'),
+                        'title': st.column_config.TextColumn('Article Title'),
+                        'published': st.column_config.TextColumn('Published Date')
+                    }
                 )
         
         with tab3:
-            st.subheader("Analysis Dashboard")
-            
-            # Stock mentions chart
-            if st.session_state.crawled_articles:
-                mentions = extract_stock_mentions(st.session_state.crawled_articles)
-                if mentions:
-                    mentions_df = pd.DataFrame(
-                        [(k, len(v)) for k, v in mentions.items()],
-                        columns=['Ticker', 'Mentions']
-                    ).sort_values('Mentions', ascending=False)
-                    
-                    st.bar_chart(
-                        mentions_df.set_index('Ticker'),
-                        use_container_width=True
-                    )
+            render_analytics_dashboard(
+                st.session_state.crawled_articles,
+                st.session_state.recommendations
+            )
     else:
         col1, col2 = st.columns(2)
         with col1:
