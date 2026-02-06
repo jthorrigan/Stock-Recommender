@@ -16,11 +16,6 @@ import xml.etree.ElementTree as ET
 import re
 import numpy as np
 
-try:
-    import yfinance as yf
-except ImportError:
-    yf = None
-
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -192,85 +187,122 @@ def get_enhanced_metrics(ticker: str) -> Dict:
     }
     
     try:
-        # Primary source: yfinance (completely free, no API key needed)
-        if yf is not None:
-            yf_ticker = yf.Ticker(ticker)
-            yf_info = yf_ticker.info
+        # Import yfinance dynamically
+        import yfinance as yf_local
+        
+        logger.info(f"Fetching metrics for {ticker} using yfinance")
+        
+        # Fetch ticker data
+        ticker_obj = yf_local.Ticker(ticker)
+        
+        # Get info with error handling
+        try:
+            ticker_info = ticker_obj.info
+        except Exception as e:
+            logger.warning(f"Error getting info for {ticker}: {str(e)}")
+            ticker_info = {}
+        
+        # Safely extract price and basic metrics
+        if ticker_info:
+            # Current price - try multiple field names
+            price = ticker_info.get('currentPrice') or ticker_info.get('regularMarketPrice')
+            if price:
+                try:
+                    metrics['price'] = round(float(price), 2)
+                except:
+                    pass
             
-            # Get price history for volatility calculation (90 days)
-            try:
-                hist = yf_ticker.history(period="90d", progress=False)
+            # P/E Ratio - try multiple field names
+            pe = ticker_info.get('trailingPE') or ticker_info.get('forwardPE')
+            if pe and pe != 'N/A':
+                try:
+                    metrics['pe_ratio'] = round(float(pe), 2)
+                except:
+                    pass
+            
+            # 52-week high/low
+            high_52 = ticker_info.get('fiftyTwoWeekHigh')
+            if high_52:
+                try:
+                    metrics['52_week_high'] = round(float(high_52), 2)
+                except:
+                    pass
+            
+            low_52 = ticker_info.get('fiftyTwoWeekLow')
+            if low_52:
+                try:
+                    metrics['52_week_low'] = round(float(low_52), 2)
+                except:
+                    pass
+            
+            # Market cap
+            market_cap = ticker_info.get('marketCap')
+            if market_cap:
+                try:
+                    if market_cap >= 1e9:
+                        metrics['market_cap'] = f"${market_cap/1e9:.1f}B"
+                    elif market_cap >= 1e6:
+                        metrics['market_cap'] = f"${market_cap/1e6:.1f}M"
+                except:
+                    pass
+            
+            # Dividend yield
+            div_yield = ticker_info.get('dividendYield')
+            if div_yield:
+                try:
+                    metrics['dividend_yield'] = round(float(div_yield) * 100, 2)
+                except:
+                    pass
+            
+            # EPS
+            eps = ticker_info.get('trailingEps')
+            if eps:
+                try:
+                    metrics['eps'] = round(float(eps), 2)
+                except:
+                    pass
+            
+            # Profit margin
+            profit_margin = ticker_info.get('profitMargins')
+            if profit_margin:
+                try:
+                    metrics['profit_margin'] = round(float(profit_margin) * 100, 2)
+                except:
+                    pass
+        
+        # Get historical data for volatility
+        try:
+            logger.info(f"Fetching historical data for {ticker}")
+            hist = ticker_obj.history(period="90d", progress=False)
+            
+            if hist is not None and not hist.empty and len(hist) > 1:
+                close_prices = hist['Close']
                 
-                if not hist.empty and len(hist) > 1:
-                    # Calculate volatility from 90-day returns
-                    returns = hist['Close'].pct_change().dropna()
-                    if len(returns) > 0:
-                        volatility = returns.std() * np.sqrt(252)  # Annualized
-                        metrics['volatility'] = round(volatility * 100, 2)
-            except Exception as e:
-                logger.debug(f"Error calculating volatility for {ticker}: {str(e)}")
-            
-            # Extract metrics from yfinance
-            if yf_info.get('trailingPE') and yf_info.get('trailingPE') != 'N/A':
-                metrics['pe_ratio'] = round(float(yf_info.get('trailingPE', 'N/A')), 2)
-            
-            if yf_info.get('currentPrice'):
-                metrics['price'] = round(float(yf_info.get('currentPrice')), 2)
-            
-            if yf_info.get('fiftyTwoWeekHigh'):
-                metrics['52_week_high'] = round(float(yf_info.get('fiftyTwoWeekHigh')), 2)
-            
-            if yf_info.get('fiftyTwoWeekLow'):
-                metrics['52_week_low'] = round(float(yf_info.get('fiftyTwoWeekLow')), 2)
-            
-            if yf_info.get('marketCap'):
-                market_cap = yf_info.get('marketCap')
-                if market_cap >= 1e9:
-                    metrics['market_cap'] = f"${market_cap/1e9:.1f}B"
-                elif market_cap >= 1e6:
-                    metrics['market_cap'] = f"${market_cap/1e6:.1f}M"
-            
-            if yf_info.get('dividendYield'):
-                metrics['dividend_yield'] = round(float(yf_info.get('dividendYield')) * 100, 2)
-            
-            if yf_info.get('trailingEps'):
-                metrics['eps'] = round(float(yf_info.get('trailingEps')), 2)
-            
-            if yf_info.get('profitMargins'):
-                metrics['profit_margin'] = round(float(yf_info.get('profitMargins')) * 100, 2)
-            
+                # Calculate daily returns
+                returns = close_prices.pct_change().dropna()
+                
+                if len(returns) > 0:
+                    # Annualized volatility
+                    volatility = returns.std() * np.sqrt(252)
+                    metrics['volatility'] = round(volatility * 100, 2)
+                    logger.info(f"Calculated volatility for {ticker}: {metrics['volatility']}%")
+        
+        except Exception as e:
+            logger.warning(f"Error calculating volatility for {ticker}: {str(e)}")
+        
+        # Set data source
+        if metrics['price'] != 'N/A' or metrics['pe_ratio'] != 'N/A':
             metrics['data_source'] = 'yfinance'
         
-        # Secondary source: Finnhub (if API key available - backup/validation)
-        if FINNHUB_API_KEY:
-            try:
-                finnhub_url = f"https://finnhub.io/api/v1/quote?symbol={ticker}&token={FINNHUB_API_KEY}"
-                response = requests.get(finnhub_url, timeout=5)
-                
-                if response.status_code == 200:
-                    finnhub_data = response.json()
-                    
-                    # Use Finnhub as fallback if yfinance data is missing
-                    if metrics['pe_ratio'] == 'N/A' and finnhub_data.get('pe'):
-                        metrics['pe_ratio'] = round(float(finnhub_data.get('pe')), 2)
-                    
-                    if metrics['52_week_high'] == 'N/A' and finnhub_data.get('h52'):
-                        metrics['52_week_high'] = round(float(finnhub_data.get('h52')), 2)
-                    
-                    if metrics['52_week_low'] == 'N/A' and finnhub_data.get('l52'):
-                        metrics['52_week_low'] = round(float(finnhub_data.get('l52')), 2)
-                    
-                    if metrics['price'] == 'N/A' and finnhub_data.get('c'):
-                        metrics['price'] = round(float(finnhub_data.get('c')), 2)
-                    
-                    if metrics['data_source'] == 'yfinance':
-                        metrics['data_source'] = 'yfinance + Finnhub'
-            
-            except Exception as e:
-                logger.debug(f"Error fetching Finnhub data for {ticker}: {str(e)}")
+        logger.info(f"Successfully fetched metrics for {ticker}: {metrics}")
+        
+    except ImportError:
+        logger.error("yfinance not installed. Run: pip install yfinance")
+        metrics['data_source'] = 'Error: yfinance not installed'
     
     except Exception as e:
-        logger.warning(f"Error fetching enhanced metrics for {ticker}: {str(e)}")
+        logger.error(f"Error fetching enhanced metrics for {ticker}: {str(e)}")
+        metrics['data_source'] = f'Error: {str(e)}'
     
     return metrics
 
@@ -1059,7 +1091,7 @@ def render_analytics_dashboard(articles: List[Dict], recommendations: List[Dict]
             - CAPE Ratio: FRED (Federal Reserve Economic Data - if configured)
             """)
         else:
-            st.info("Financial metrics data not available. Check if yfinance is installed.")
+            st.info("Financial metrics data not available. Check if yfinance is installed: `pip install yfinance`")
     
     st.markdown("---")
     
@@ -1162,9 +1194,10 @@ def main():
             
             with col2:
                 st.subheader("Financial Data")
-                if yf is not None:
+                try:
+                    import yfinance
                     st.success("✅ yfinance ready (no key needed!)")
-                else:
+                except ImportError:
                     st.error("❌ yfinance not installed")
             
             st.divider()
