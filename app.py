@@ -1,5 +1,6 @@
 """
-Stock Recommendation Web App - WITH SECRETS DIAGNOSTIC
+Stock Recommendation Web App - Streamlit Application
+FINAL VERSION WITH CORRECT SECRET NAMES
 """
 
 import streamlit as st
@@ -20,53 +21,18 @@ logger = logging.getLogger(__name__)
 st.set_page_config(page_title="Stock Recommendation Engine", page_icon="📈", layout="wide")
 
 # ============================================================================
-# DIAGNOSTIC: CHECK WHAT'S IN SECRETS
+# API KEY LOADING - EXACT NAMES FROM SECRETS
 # ============================================================================
 
-st.sidebar.header("🔍 Secrets Diagnostic")
+# These match EXACTLY what's in your secrets.toml
+FMP_API_KEY = st.secrets.get("fmp_api_key", "")
+EODHD_API_KEY = st.secrets.get("eodhd_api_key", "")
+FRED_API_KEY = st.secrets.get("FRED_API_KEY", "")
+HF_API_KEY = st.secrets.get("HF_API_KEY", "")
 
-with st.sidebar.expander("View Secrets (Debug)"):
-    st.write("**All secrets keys:**")
-    try:
-        all_keys = list(st.secrets.keys())
-        st.write(all_keys)
-    except Exception as e:
-        st.error(f"Error reading secrets: {e}")
-    
-    st.write("**Specific key values:**")
-    st.write(f"fmp_api_key: `{st.secrets.get('fmp_api_key', 'NOT FOUND')}`")
-    st.write(f"eodhd_api_key: `{st.secrets.get('eodhd_api_key', 'NOT FOUND')}`")
-    st.write(f"fred_api_key: `{st.secrets.get('fred_api_key', 'NOT FOUND')}`")
-    st.write(f"hf_api_key: `{st.secrets.get('hf_api_key', 'NOT FOUND')}`")
-
-# ============================================================================
-# LOAD API KEYS - MULTIPLE METHODS
-# ============================================================================
-
-# Method 1: Try st.secrets directly
-fmp_key_1 = st.secrets.get("fmp_api_key")
-eodhd_key_1 = st.secrets.get("eodhd_api_key")
-fred_key_1 = st.secrets.get("fred_api_key")
-
-# Method 2: Try with .toml key variations
-fmp_key_2 = st.secrets.get("FMP_API_KEY") or st.secrets.get("fmp_api_key")
-eodhd_key_2 = st.secrets.get("EODHD_API_KEY") or st.secrets.get("eodhd_api_key")
-fred_key_2 = st.secrets.get("FRED_API_KEY") or st.secrets.get("fred_api_key")
-
-# Method 3: Try environment variables as last resort
-fmp_key_3 = os.getenv("FMP_API_KEY")
-eodhd_key_3 = os.getenv("EODHD_API_KEY")
-fred_key_3 = os.getenv("FRED_API_KEY")
-
-# Use whichever method worked
-FMP_API_KEY = fmp_key_1 or fmp_key_2 or fmp_key_3 or ""
-EODHD_API_KEY = eodhd_key_1 or eodhd_key_2 or eodhd_key_3 or ""
-FRED_API_KEY = fred_key_1 or fred_key_2 or fred_key_3 or ""
-HF_API_KEY = st.secrets.get("hf_api_key") or st.secrets.get("HF_API_KEY") or os.getenv("HF_API_KEY") or ""
-
-logger.info(f"FMP_API_KEY loaded: {bool(FMP_API_KEY)}")
-logger.info(f"EODHD_API_KEY loaded: {bool(EODHD_API_KEY)}")
-logger.info(f"FRED_API_KEY loaded: {bool(FRED_API_KEY)}")
+logger.info(f"✅ FMP loaded: {bool(FMP_API_KEY)}")
+logger.info(f"✅ EODHD loaded: {bool(EODHD_API_KEY)}")
+logger.info(f"✅ FRED loaded: {bool(FRED_API_KEY)}")
 
 # API endpoints
 FMP_BASE_URL = "https://financialmodelingprep.com/api/v3"
@@ -112,6 +78,10 @@ def init_session():
     return st.session_state
 
 init_session()
+
+def clear_cache():
+    st.cache_data.clear()
+    st.cache_resource.clear()
 
 # ============================================================================
 # API FUNCTIONS
@@ -195,15 +165,23 @@ def get_enhanced_metrics(ticker: str) -> Dict:
     
     # Try FMP
     if FMP_API_KEY:
+        logger.info(f"[FMP] Fetching {ticker}")
         fmp_quote = get_fmp_quote(ticker)
         fmp_profile = get_fmp_profile(ticker)
         
         if fmp_quote and fmp_quote.get('price'):
             metrics['price'] = round(float(fmp_quote.get('price')), 2)
+            logger.info(f"[FMP] ✅ Price: ${metrics['price']}")
+            
             if fmp_quote.get('pe'):
-                metrics['pe_ratio'] = round(float(fmp_quote.get('pe')), 2)
+                try:
+                    metrics['pe_ratio'] = round(float(fmp_quote.get('pe')), 2)
+                except:
+                    pass
+            
             if fmp_quote.get('yearHigh'):
                 metrics['52_week_high'] = round(float(fmp_quote.get('yearHigh')), 2)
+            
             if fmp_quote.get('yearLow'):
                 metrics['52_week_low'] = round(float(fmp_quote.get('yearLow')), 2)
         
@@ -220,13 +198,16 @@ def get_enhanced_metrics(ticker: str) -> Dict:
     
     # Try EODHD
     if EODHD_API_KEY:
+        logger.info(f"[EODHD] Fetching {ticker}")
         eodhd_quote = get_eodhd_quote(ticker)
         
         if eodhd_quote and eodhd_quote.get('close'):
             metrics['price'] = round(float(eodhd_quote.get('close')), 2)
+            logger.info(f"[EODHD] ✅ Price: ${metrics['price']}")
             metrics['data_source'] = 'EODHD ✅'
             return metrics
     
+    logger.warning(f"[API] ❌ No data for {ticker}")
     metrics['data_source'] = 'No Data Available'
     return metrics
 
@@ -250,7 +231,7 @@ def get_company_info(ticker: str) -> Dict:
             'category': TICKER_CATEGORIES.get(ticker, 'Unknown'),
         }
     except Exception as e:
-        logger.warning(f"Error: {e}")
+        logger.warning(f"Company info error: {e}")
         return {
             'ticker': ticker,
             'name': ticker,
@@ -375,10 +356,14 @@ with st.sidebar:
     st.divider()
     st.markdown("### 🧪 Test API")
     test_ticker = st.text_input("Ticker:", "AAPL")
-    if st.button("Test", use_container_width=True):
-        st.info("Testing...")
+    if st.button("📍 Test", use_container_width=True):
+        st.info(f"Testing {test_ticker}...")
         metrics = get_enhanced_metrics(test_ticker)
         st.json(metrics)
+    
+    if st.button("🗑️ Clear Cache"):
+        clear_cache()
+        st.success("Cleared!")
 
 st.write("---")
 
@@ -402,6 +387,7 @@ if has_crawl:
                     'Price': metrics['price'],
                     'Source': metrics['data_source']
                 })
-            st.dataframe(pd.DataFrame(ticker_data), use_container_width=True)
+            if ticker_data:
+                st.dataframe(pd.DataFrame(ticker_data), use_container_width=True)
 else:
-    st.info("Run crawler to start")
+    st.info("👈 Run crawler to start")
