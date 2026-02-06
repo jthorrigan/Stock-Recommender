@@ -166,8 +166,8 @@ def get_company_info(ticker: str) -> Dict:
 @st.cache_data(ttl=3600)
 def get_enhanced_metrics(ticker: str) -> Dict:
     """
-    Fetch comprehensive stock metrics using multiple free APIs
-    Simplified version that focuses on what actually works
+    Fetch comprehensive stock metrics using Yahoo Finance and Finnhub
+    Simplified version focusing on what actually works reliably
     
     Args:
         ticker: Stock ticker symbol
@@ -195,7 +195,7 @@ def get_enhanced_metrics(ticker: str) -> Dict:
     try:
         logger.info(f"Fetching metrics for {ticker}")
         
-        # Try Yahoo Finance first (most reliable without auth)
+        # Primary: Yahoo Finance (most reliable without auth)
         try:
             logger.info(f"Trying Yahoo Finance for {ticker}")
             url = f"https://query1.finance.yahoo.com/v10/finance/quoteSummary/{ticker}?modules=price,financialData,defaultKeyStatistics,summaryDetail"
@@ -244,25 +244,25 @@ def get_enhanced_metrics(ticker: str) -> Dict:
                                     metrics['market_cap'] = f"${market_cap/1e6:.1f}M"
                             except:
                                 pass
-                    
-                    # P/E Ratio from summaryDetail
-                    if 'summaryDetail' in result and 'trailingPE' in result['summaryDetail']:
-                        try:
-                            pe = result['summaryDetail']['trailingPE']['raw']
-                            if pe and pe > 0:
-                                metrics['pe_ratio'] = round(float(pe), 2)
-                                logger.info(f"{ticker} P/E: {metrics['pe_ratio']}")
-                        except:
-                            pass
-                    
-                    # Dividend yield
-                    if 'summaryDetail' in result and 'trailingAnnualDividendYield' in result['summaryDetail']:
-                        try:
-                            div = result['summaryDetail']['trailingAnnualDividendYield']['raw']
-                            if div and div > 0:
-                                metrics['dividend_yield'] = round(float(div) * 100, 2)
-                        except:
-                            pass
+                        
+                        # P/E Ratio
+                        if 'trailingPE' in detail:
+                            try:
+                                pe = detail['trailingPE']['raw']
+                                if pe and pe > 0:
+                                    metrics['pe_ratio'] = round(float(pe), 2)
+                                    logger.info(f"{ticker} P/E: {metrics['pe_ratio']}")
+                            except:
+                                pass
+                        
+                        # Dividend yield
+                        if 'trailingAnnualDividendYield' in detail:
+                            try:
+                                div = detail['trailingAnnualDividendYield']['raw']
+                                if div and div > 0:
+                                    metrics['dividend_yield'] = round(float(div) * 100, 2)
+                            except:
+                                pass
                     
                     metrics['data_source'] = 'Yahoo Finance'
                     logger.info(f"Success with Yahoo Finance for {ticker}")
@@ -302,125 +302,6 @@ def get_enhanced_metrics(ticker: str) -> Dict:
     
     except Exception as e:
         logger.error(f"Unexpected error for {ticker}: {str(e)}")
-        metrics['data_source'] = f'Error: {str(e)}'
-        return metrics
-            
-            except Exception as fh_err:
-                logger.warning(f"Finnhub failed: {fh_err}")
-        
-        # Secondary: Alpha Vantage GLOBAL_QUOTE
-        if ALPHA_VANTAGE_API_KEY != "demo":
-            try:
-                logger.info(f"Fetching from Alpha Vantage for {ticker}")
-                params = {
-                    'function': 'GLOBAL_QUOTE',
-                    'symbol': ticker,
-                    'apikey': ALPHA_VANTAGE_API_KEY
-                }
-                response = requests.get('https://www.alphavantage.co/query', params=params, timeout=10)
-                data = response.json()
-                
-                if 'Global Quote' in data and data['Global Quote']:
-                    quote = data['Global Quote']
-                    
-                    # Price
-                    if quote.get('05. price'):
-                        try:
-                            metrics['price'] = round(float(quote.get('05. price')), 2)
-                            logger.info(f"{ticker} price: ${metrics['price']}")
-                        except:
-                            pass
-                    
-                    # 52-week high/low
-                    if quote.get('52WeekHigh'):
-                        try:
-                            metrics['52_week_high'] = round(float(quote.get('52WeekHigh')), 2)
-                        except:
-                            pass
-                    
-                    if quote.get('52WeekLow'):
-                        try:
-                            metrics['52_week_low'] = round(float(quote.get('52WeekLow')), 2)
-                        except:
-                            pass
-                    
-                    metrics['data_source'] = 'Alpha Vantage'
-                    logger.info(f"Alpha Vantage data for {ticker}: {metrics}")
-                    return metrics
-            
-            except Exception as av_err:
-                logger.warning(f"Alpha Vantage failed: {av_err}")
-        
-        # Tertiary: Yahoo Finance via free API endpoint
-        try:
-            logger.info(f"Trying Yahoo Finance free endpoint for {ticker}")
-            url = f"https://query1.finance.yahoo.com/v10/finance/quoteSummary/{ticker}?modules=price,financialData,defaultKeyStatistics"
-            headers = {'User-Agent': 'Mozilla/5.0'}
-            response = requests.get(url, headers=headers, timeout=10)
-            
-            if response.status_code == 200:
-                data = response.json()
-                
-                if 'quoteSummary' in data and 'result' in data['quoteSummary'] and len(data['quoteSummary']['result']) > 0:
-                    result = data['quoteSummary']['result'][0]
-                    
-                    # Price
-                    if 'price' in result and 'regularMarketPrice' in result['price']:
-                        try:
-                            price_val = result['price']['regularMarketPrice']['raw']
-                            metrics['price'] = round(float(price_val), 2)
-                            logger.info(f"{ticker} price from Yahoo: ${metrics['price']}")
-                        except Exception as p_err:
-                            logger.debug(f"Price extraction failed: {p_err}")
-                    
-                    # 52-week high/low
-                    if 'defaultKeyStatistics' in result:
-                        stats = result['defaultKeyStatistics']
-                        
-                        if 'fiftyTwoWeekHigh' in stats:
-                            try:
-                                metrics['52_week_high'] = round(float(stats['fiftyTwoWeekHigh']['raw']), 2)
-                            except:
-                                pass
-                        
-                        if 'fiftyTwoWeekLow' in stats:
-                            try:
-                                metrics['52_week_low'] = round(float(stats['fiftyTwoWeekLow']['raw']), 2)
-                            except:
-                                pass
-                    
-                    # P/E Ratio
-                    if 'financialData' in result and 'trailingPE' in result['financialData']:
-                        try:
-                            pe = result['financialData']['trailingPE']['raw']
-                            if pe and pe > 0:
-                                metrics['pe_ratio'] = round(float(pe), 2)
-                                logger.info(f"{ticker} P/E: {metrics['pe_ratio']}")
-                        except:
-                            pass
-                    
-                    # Dividend yield
-                    if 'financialData' in result and 'dividendYield' in result['financialData']:
-                        try:
-                            div = result['financialData']['dividendYield']['raw']
-                            if div and div > 0:
-                                metrics['dividend_yield'] = round(float(div) * 100, 2)
-                        except:
-                            pass
-                    
-                    metrics['data_source'] = 'Yahoo Finance (Free)'
-                    logger.info(f"Yahoo Finance data for {ticker}: {metrics}")
-                    return metrics
-        
-        except Exception as yf_err:
-            logger.warning(f"Yahoo Finance endpoint failed: {yf_err}")
-        
-        logger.error(f"All data sources failed for {ticker}")
-        metrics['data_source'] = 'No Data Available - All APIs failed'
-        return metrics
-    
-    except Exception as e:
-        logger.error(f"Unexpected error in get_enhanced_metrics for {ticker}: {str(e)}")
         metrics['data_source'] = f'Error: {str(e)}'
         return metrics
 
@@ -1204,12 +1085,11 @@ def render_analytics_dashboard(articles: List[Dict], recommendations: List[Dict]
             - **Dividend Yield (%)**: Annual dividend as percentage of stock price
             - **EPS**: Earnings Per Share
             - **Profit Margin (%)**: Net profit as percentage of revenue
-            - **Data Source**: Which API provided the metrics (Finnhub, Alpha Vantage, or Yahoo Finance)
+            - **Data Source**: Which API provided the metrics (Yahoo Finance or Finnhub)
             
             **Data Sources:** 
-            - Finnhub (primary if API key configured) - Most comprehensive data
-            - Alpha Vantage (secondary - if key configured)
-            - Yahoo Finance free endpoint (tertiary - automatic fallback)
+            - Yahoo Finance (primary - free public API, no key needed)
+            - Finnhub (fallback - if API key configured)
             - FRED (Federal Reserve Economic Data - if configured for CAPE ratio)
             """)
         else:
@@ -1339,41 +1219,38 @@ def main():
             
             with col2:
                 st.subheader("Financial Data")
-                if FINNHUB_API_KEY:
-                    st.success("✅ Finnhub ready")
-                elif ALPHA_VANTAGE_API_KEY != "demo":
-                    st.success("✅ Alpha Vantage ready")
-                else:
-                    st.warning("⚠️ Will use Yahoo Finance")
+                st.success("✅ Yahoo Finance ready (no key needed!)")
             
             st.divider()
             
             st.markdown("""
             **API Status:**
             
-            ✅ **Finnhub** (PRIMARY - FREE TIER)
-            - Get comprehensive stock data
+            ✅ **Yahoo Finance** (PRIMARY - NO KEY NEEDED)
+            - Get real-time stock prices, P/E ratios, 52W highs/lows
+            - Free public API, no authentication required
+            - Most reliable for comprehensive data
+            
+            ⭐ **Finnhub** (OPTIONAL - FALLBACK)
+            - Fallback data source if Yahoo Finance unavailable
             - Free tier: 60 calls/minute
             - Get key: https://finnhub.io/
             - Add to secrets: `FINNHUB_API_KEY=...`
             
-            ✅ **Alpha Vantage** (SECONDARY - FREE TIER)
-            - Get real stock prices and 52W ranges
-            - Get API key: https://www.alphavantage.co/api/
+            ⭐ **Alpha Vantage** (OPTIONAL - COMPANY INFO)
+            - Get company sector, industry, description
+            - Free tier: 5 calls/minute
+            - Get key: https://www.alphavantage.co/api/
             - Add to secrets: `ALPHA_VANTAGE_API_KEY=...`
             
-            ✅ **Yahoo Finance** (FALLBACK - NO KEY NEEDED)
-            - Automatic fallback if others unavailable
-            - Free public endpoint
-            
             ⭐ **FRED** (OPTIONAL - CAPE RATIO)
-            - S&P 500 Shiller P/E data
-            - Completely free
+            - S&P 500 Shiller P/E data for market comparison
+            - Completely free, no limits
             - Get key: https://fred.stlouisfed.org/docs/api/fred/
             - Add to secrets: `FRED_API_KEY=...`
             
             ⭐ **Hugging Face** (OPTIONAL - AI)
-            - Generate 500-word explanations
+            - Generate 500-word investment explanations
             - Get key: https://huggingface.co/settings/tokens
             - Add to secrets: `HF_API_KEY=hf_...`
             """)
