@@ -166,8 +166,8 @@ def get_company_info(ticker: str) -> Dict:
 @st.cache_data(ttl=3600)
 def get_enhanced_metrics(ticker: str) -> Dict:
     """
-    Fetch comprehensive stock metrics using Finnhub, Alpha Vantage, and Yahoo Finance APIs
-    This is the most reliable approach on Streamlit Cloud
+    Fetch comprehensive stock metrics using multiple free APIs
+    Simplified version that focuses on what actually works
     
     Args:
         ticker: Stock ticker symbol
@@ -193,84 +193,117 @@ def get_enhanced_metrics(ticker: str) -> Dict:
     }
     
     try:
-        logger.info(f"Fetching metrics for {ticker} using free APIs")
+        logger.info(f"Fetching metrics for {ticker}")
         
-        # Primary: Try Finnhub first (most reliable for comprehensive data)
-        if FINNHUB_API_KEY:
-            try:
-                logger.info(f"Fetching from Finnhub for {ticker}")
+        # Try Yahoo Finance first (most reliable without auth)
+        try:
+            logger.info(f"Trying Yahoo Finance for {ticker}")
+            url = f"https://query1.finance.yahoo.com/v10/finance/quoteSummary/{ticker}?modules=price,financialData,defaultKeyStatistics,summaryDetail"
+            headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
+            response = requests.get(url, headers=headers, timeout=10)
+            
+            if response.status_code == 200:
+                data = response.json()
                 
-                # Get quote data
-                quote_url = f"https://finnhub.io/api/v1/quote?symbol={ticker}&token={FINNHUB_API_KEY}"
-                quote_response = requests.get(quote_url, timeout=5)
-                
-                if quote_response.status_code == 200:
-                    quote_data = quote_response.json()
-                    logger.info(f"Finnhub quote for {ticker}: {quote_data}")
+                if 'quoteSummary' in data and 'result' in data['quoteSummary'] and len(data['quoteSummary']['result']) > 0:
+                    result = data['quoteSummary']['result'][0]
+                    logger.info(f"Yahoo Finance result keys: {list(result.keys())}")
                     
                     # Price
+                    if 'price' in result and 'regularMarketPrice' in result['price']:
+                        try:
+                            price_val = result['price']['regularMarketPrice']['raw']
+                            metrics['price'] = round(float(price_val), 2)
+                            logger.info(f"{ticker} price: ${metrics['price']}")
+                        except Exception as e:
+                            logger.debug(f"Price extraction failed: {e}")
+                    
+                    # 52-week high/low from summaryDetail
+                    if 'summaryDetail' in result:
+                        detail = result['summaryDetail']
+                        
+                        if 'fiftyTwoWeekHigh' in detail:
+                            try:
+                                metrics['52_week_high'] = round(float(detail['fiftyTwoWeekHigh']['raw']), 2)
+                            except:
+                                pass
+                        
+                        if 'fiftyTwoWeekLow' in detail:
+                            try:
+                                metrics['52_week_low'] = round(float(detail['fiftyTwoWeekLow']['raw']), 2)
+                            except:
+                                pass
+                        
+                        # Market cap
+                        if 'marketCap' in detail:
+                            try:
+                                market_cap = detail['marketCap']['raw']
+                                if market_cap >= 1e9:
+                                    metrics['market_cap'] = f"${market_cap/1e9:.1f}B"
+                                elif market_cap >= 1e6:
+                                    metrics['market_cap'] = f"${market_cap/1e6:.1f}M"
+                            except:
+                                pass
+                    
+                    # P/E Ratio from summaryDetail
+                    if 'summaryDetail' in result and 'trailingPE' in result['summaryDetail']:
+                        try:
+                            pe = result['summaryDetail']['trailingPE']['raw']
+                            if pe and pe > 0:
+                                metrics['pe_ratio'] = round(float(pe), 2)
+                                logger.info(f"{ticker} P/E: {metrics['pe_ratio']}")
+                        except:
+                            pass
+                    
+                    # Dividend yield
+                    if 'summaryDetail' in result and 'trailingAnnualDividendYield' in result['summaryDetail']:
+                        try:
+                            div = result['summaryDetail']['trailingAnnualDividendYield']['raw']
+                            if div and div > 0:
+                                metrics['dividend_yield'] = round(float(div) * 100, 2)
+                        except:
+                            pass
+                    
+                    metrics['data_source'] = 'Yahoo Finance'
+                    logger.info(f"Success with Yahoo Finance for {ticker}")
+                    return metrics
+        
+        except Exception as yf_err:
+            logger.warning(f"Yahoo Finance failed: {yf_err}")
+        
+        # Fallback: Finnhub for price only
+        if FINNHUB_API_KEY:
+            try:
+                logger.info(f"Trying Finnhub for {ticker}")
+                quote_url = f"https://finnhub.io/api/v1/quote?symbol={ticker}&token={FINNHUB_API_KEY}"
+                response = requests.get(quote_url, timeout=5)
+                
+                if response.status_code == 200:
+                    quote_data = response.json()
+                    logger.info(f"Finnhub quote: {quote_data}")
+                    
                     if quote_data.get('c'):
                         metrics['price'] = round(float(quote_data.get('c')), 2)
-                    
-                    # 52-week high/low
                     if quote_data.get('h52'):
                         metrics['52_week_high'] = round(float(quote_data.get('h52')), 2)
                     if quote_data.get('l52'):
                         metrics['52_week_low'] = round(float(quote_data.get('l52')), 2)
-                
-                # Get company profile for more metrics
-                profile_url = f"https://finnhub.io/api/v1/stock/profile2?symbol={ticker}&token={FINNHUB_API_KEY}"
-                profile_response = requests.get(profile_url, timeout=5)
-                
-                if profile_response.status_code == 200:
-                    profile_data = profile_response.json()
-                    logger.info(f"Finnhub profile for {ticker}: {profile_data}")
                     
-                    if profile_data.get('marketCapitalization'):
-                        market_cap = profile_data.get('marketCapitalization')
-                        if market_cap >= 1e9:
-                            metrics['market_cap'] = f"${market_cap/1e9:.1f}B"
-                        elif market_cap >= 1e6:
-                            metrics['market_cap'] = f"${market_cap/1e6:.1f}M"
-                
-                # Get financials for EPS, P/E, etc
-                financials_url = f"https://finnhub.io/api/v1/stock/financials?symbol={ticker}&token={FINNHUB_API_KEY}"
-                financials_response = requests.get(financials_url, timeout=5)
-                
-                if financials_response.status_code == 200:
-                    financials_data = financials_response.json()
-                    logger.info(f"Finnhub financials for {ticker}: {financials_data}")
-                    
-                    if 'metric' in financials_data:
-                        metric_data = financials_data['metric']
-                        
-                        # P/E Ratio
-                        if metric_data.get('peRatioTTM'):
-                            pe = metric_data.get('peRatioTTM')
-                            if pe and pe > 0:
-                                metrics['pe_ratio'] = round(float(pe), 2)
-                        
-                        # EPS
-                        if metric_data.get('epsBasicExclExtraordinary'):
-                            eps = metric_data.get('epsBasicExclExtraordinary')
-                            if eps:
-                                metrics['eps'] = round(float(eps), 2)
-                        
-                        # Profit margin
-                        if metric_data.get('netProfitMargin'):
-                            margin = metric_data.get('netProfitMargin')
-                            if margin:
-                                metrics['profit_margin'] = round(float(margin) * 100, 2)
-                        
-                        # Dividend yield
-                        if metric_data.get('dividendYield'):
-                            div = metric_data.get('dividendYield')
-                            if div and div > 0:
-                                metrics['dividend_yield'] = round(float(div) * 100, 2)
-                
-                metrics['data_source'] = 'Finnhub'
-                logger.info(f"Final Finnhub metrics for {ticker}: {metrics}")
-                return metrics
+                    metrics['data_source'] = 'Finnhub'
+                    logger.info(f"Success with Finnhub for {ticker}")
+                    return metrics
+            
+            except Exception as fh_err:
+                logger.warning(f"Finnhub failed: {fh_err}")
+        
+        logger.error(f"All data sources failed for {ticker}")
+        metrics['data_source'] = 'No Data - All APIs failed'
+        return metrics
+    
+    except Exception as e:
+        logger.error(f"Unexpected error for {ticker}: {str(e)}")
+        metrics['data_source'] = f'Error: {str(e)}'
+        return metrics
             
             except Exception as fh_err:
                 logger.warning(f"Finnhub failed: {fh_err}")
