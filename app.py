@@ -78,6 +78,12 @@ def init_session():
         st.session_state.crawled_articles = []
     return st.session_state
 
+def clear_cache():
+    """Clear all Streamlit caches"""
+    st.cache_data.clear()
+    st.cache_resource.clear()
+    logger.info("Cache cleared")
+
 # ============================================================================
 # COMPANY DATA FUNCTIONS
 # ============================================================================
@@ -192,85 +198,123 @@ def get_enhanced_metrics(ticker: str) -> Dict:
         
         logger.info(f"Fetching metrics for {ticker} using yfinance")
         
-        # Fetch ticker data
-        ticker_obj = yf_local.Ticker(ticker)
-        
-        # Get info with error handling
+        # Fetch ticker data with timeout
         try:
+            ticker_obj = yf_local.Ticker(ticker)
+            # Force refresh and set short timeout
             ticker_info = ticker_obj.info
+            
+            logger.info(f"Raw ticker info keys for {ticker}: {list(ticker_info.keys())[:15]}")
+        
         except Exception as e:
-            logger.warning(f"Error getting info for {ticker}: {str(e)}")
+            logger.error(f"Error getting info for {ticker}: {str(e)}")
             ticker_info = {}
         
-        # Safely extract price and basic metrics
+        # Try to extract data - multiple attempts with different field names
         if ticker_info:
-            # Current price - try multiple field names
-            price = ticker_info.get('currentPrice') or ticker_info.get('regularMarketPrice')
-            if price:
-                try:
-                    metrics['price'] = round(float(price), 2)
-                except:
-                    pass
+            logger.info(f"Processing {len(ticker_info)} fields for {ticker}")
+            
+            # Current price - try ALL possible field names
+            for price_field in ['currentPrice', 'regularMarketPrice', 'bid', 'ask', 'lastPrice']:
+                price = ticker_info.get(price_field)
+                if price and price != 0 and price != 'N/A':
+                    try:
+                        metrics['price'] = round(float(price), 2)
+                        logger.info(f"{ticker} price from {price_field}: {metrics['price']}")
+                        break
+                    except Exception as pe:
+                        logger.debug(f"Price extraction from {price_field} failed: {pe}")
             
             # P/E Ratio - try multiple field names
-            pe = ticker_info.get('trailingPE') or ticker_info.get('forwardPE')
-            if pe and pe != 'N/A':
-                try:
-                    metrics['pe_ratio'] = round(float(pe), 2)
-                except:
-                    pass
+            for pe_field in ['trailingPE', 'forwardPE', 'trailingPEG', 'priceToBook']:
+                pe = ticker_info.get(pe_field)
+                if pe and pe != 'N/A' and pe != 0:
+                    try:
+                        pe_val = float(pe)
+                        if 0 < pe_val < 1000:  # Sanity check
+                            metrics['pe_ratio'] = round(pe_val, 2)
+                            logger.info(f"{ticker} P/E from {pe_field}: {metrics['pe_ratio']}")
+                            break
+                    except Exception as pe_err:
+                        logger.debug(f"P/E extraction from {pe_field} failed: {pe_err}")
             
-            # 52-week high/low
-            high_52 = ticker_info.get('fiftyTwoWeekHigh')
-            if high_52:
-                try:
-                    metrics['52_week_high'] = round(float(high_52), 2)
-                except:
-                    pass
+            # 52-week high - try multiple field names
+            for high_field in ['fiftyTwoWeekHigh', 'fiftyTwoWeekChange']:
+                high_52 = ticker_info.get(high_field)
+                if high_52 and high_52 != 0 and high_52 != 'N/A':
+                    try:
+                        high_val = float(high_52)
+                        if high_val > 0:
+                            metrics['52_week_high'] = round(high_val, 2)
+                            logger.info(f"{ticker} 52W High from {high_field}: {metrics['52_week_high']}")
+                            break
+                    except Exception as h_err:
+                        logger.debug(f"52W High extraction from {high_field} failed: {h_err}")
             
-            low_52 = ticker_info.get('fiftyTwoWeekLow')
-            if low_52:
-                try:
-                    metrics['52_week_low'] = round(float(low_52), 2)
-                except:
-                    pass
+            # 52-week low
+            for low_field in ['fiftyTwoWeekLow', 'twoHundredDayAverage']:
+                low_52 = ticker_info.get(low_field)
+                if low_52 and low_52 != 0 and low_52 != 'N/A':
+                    try:
+                        low_val = float(low_52)
+                        if low_val > 0:
+                            metrics['52_week_low'] = round(low_val, 2)
+                            logger.info(f"{ticker} 52W Low from {low_field}: {metrics['52_week_low']}")
+                            break
+                    except Exception as l_err:
+                        logger.debug(f"52W Low extraction from {low_field} failed: {l_err}")
             
             # Market cap
             market_cap = ticker_info.get('marketCap')
-            if market_cap:
+            if market_cap and market_cap > 0:
                 try:
                     if market_cap >= 1e9:
                         metrics['market_cap'] = f"${market_cap/1e9:.1f}B"
                     elif market_cap >= 1e6:
                         metrics['market_cap'] = f"${market_cap/1e6:.1f}M"
-                except:
-                    pass
+                    logger.info(f"{ticker} market cap: {metrics['market_cap']}")
+                except Exception as mc_err:
+                    logger.debug(f"Market cap extraction failed: {mc_err}")
             
             # Dividend yield
-            div_yield = ticker_info.get('dividendYield')
-            if div_yield:
-                try:
-                    metrics['dividend_yield'] = round(float(div_yield) * 100, 2)
-                except:
-                    pass
+            for div_field in ['dividendYield', 'yield']:
+                div_yield = ticker_info.get(div_field)
+                if div_yield and div_yield > 0:
+                    try:
+                        div_val = float(div_yield)
+                        if 0 < div_val < 1:  # Sanity check (should be decimal)
+                            metrics['dividend_yield'] = round(div_val * 100, 2)
+                            logger.info(f"{ticker} dividend yield: {metrics['dividend_yield']}%")
+                            break
+                    except Exception as div_err:
+                        logger.debug(f"Dividend yield extraction failed: {div_err}")
             
             # EPS
-            eps = ticker_info.get('trailingEps')
-            if eps:
-                try:
-                    metrics['eps'] = round(float(eps), 2)
-                except:
-                    pass
+            for eps_field in ['trailingEps', 'epsTrailingTwelveMonths']:
+                eps = ticker_info.get(eps_field)
+                if eps and eps != 0 and eps != 'N/A':
+                    try:
+                        eps_val = float(eps)
+                        metrics['eps'] = round(eps_val, 2)
+                        logger.info(f"{ticker} EPS: {metrics['eps']}")
+                        break
+                    except Exception as eps_err:
+                        logger.debug(f"EPS extraction failed: {eps_err}")
             
             # Profit margin
-            profit_margin = ticker_info.get('profitMargins')
-            if profit_margin:
-                try:
-                    metrics['profit_margin'] = round(float(profit_margin) * 100, 2)
-                except:
-                    pass
+            for margin_field in ['profitMargins', 'operatingMargins']:
+                profit_margin = ticker_info.get(margin_field)
+                if profit_margin and profit_margin != 0 and profit_margin != 'N/A':
+                    try:
+                        margin_val = float(profit_margin)
+                        if -1 < margin_val < 10:  # Sanity check
+                            metrics['profit_margin'] = round(margin_val * 100, 2)
+                            logger.info(f"{ticker} profit margin: {metrics['profit_margin']}%")
+                            break
+                    except Exception as margin_err:
+                        logger.debug(f"Profit margin extraction failed: {margin_err}")
         
-        # Get historical data for volatility
+        # Get historical data for volatility (with retry logic)
         try:
             logger.info(f"Fetching historical data for {ticker}")
             hist = ticker_obj.history(period="90d", progress=False)
@@ -282,27 +326,62 @@ def get_enhanced_metrics(ticker: str) -> Dict:
                 returns = close_prices.pct_change().dropna()
                 
                 if len(returns) > 0:
-                    # Annualized volatility
-                    volatility = returns.std() * np.sqrt(252)
-                    metrics['volatility'] = round(volatility * 100, 2)
-                    logger.info(f"Calculated volatility for {ticker}: {metrics['volatility']}%")
+                    std_dev = returns.std()
+                    if std_dev > 0:
+                        # Annualized volatility
+                        volatility = std_dev * np.sqrt(252)
+                        if 0 < volatility < 10:  # Sanity check
+                            metrics['volatility'] = round(volatility * 100, 2)
+                            logger.info(f"Calculated volatility for {ticker}: {metrics['volatility']}%")
+                        else:
+                            logger.warning(f"Volatility for {ticker} out of range: {volatility}")
         
         except Exception as e:
             logger.warning(f"Error calculating volatility for {ticker}: {str(e)}")
         
-        # Set data source
-        if metrics['price'] != 'N/A' or metrics['pe_ratio'] != 'N/A':
-            metrics['data_source'] = 'yfinance'
+        # Try Finnhub as fallback if yfinance failed
+        if FINNHUB_API_KEY and metrics['price'] == 'N/A':
+            try:
+                logger.info(f"Trying Finnhub as fallback for {ticker}")
+                finnhub_url = f"https://finnhub.io/api/v1/quote?symbol={ticker}&token={FINNHUB_API_KEY}"
+                response = requests.get(finnhub_url, timeout=5)
+                
+                if response.status_code == 200:
+                    finnhub_data = response.json()
+                    logger.info(f"Finnhub response for {ticker}: {finnhub_data}")
+                    
+                    if finnhub_data.get('c'):
+                        metrics['price'] = round(float(finnhub_data.get('c')), 2)
+                    if finnhub_data.get('pe'):
+                        metrics['pe_ratio'] = round(float(finnhub_data.get('pe')), 2)
+                    if finnhub_data.get('h52'):
+                        metrics['52_week_high'] = round(float(finnhub_data.get('h52')), 2)
+                    if finnhub_data.get('l52'):
+                        metrics['52_week_low'] = round(float(finnhub_data.get('l52')), 2)
+                    
+                    metrics['data_source'] = 'Finnhub (Fallback)'
+            
+            except Exception as e:
+                logger.debug(f"Finnhub fallback failed for {ticker}: {str(e)}")
         
-        logger.info(f"Successfully fetched metrics for {ticker}: {metrics}")
+        # Set data source if we got any data
+        if metrics['data_source'] == 'None':
+            if metrics['price'] != 'N/A' or metrics['pe_ratio'] != 'N/A':
+                metrics['data_source'] = 'yfinance'
+            else:
+                metrics['data_source'] = 'No Data Available'
+        
+        logger.info(f"Final metrics for {ticker}: {metrics}")
         
     except ImportError:
         logger.error("yfinance not installed. Run: pip install yfinance")
         metrics['data_source'] = 'Error: yfinance not installed'
+        return metrics
     
     except Exception as e:
-        logger.error(f"Error fetching enhanced metrics for {ticker}: {str(e)}")
+        logger.error(f"Unexpected error fetching metrics for {ticker}: {str(e)}")
         metrics['data_source'] = f'Error: {str(e)}'
+        return metrics
     
     return metrics
 
@@ -1157,6 +1236,20 @@ def main():
         
         st.divider()
         
+        # Test single ticker
+        st.markdown("### 🧪 Debug Tools")
+        test_ticker = st.text_input("Test ticker (e.g., AAPL):", value="AAPL")
+        if st.button("📍 Test Single Ticker", use_container_width=True):
+            st.info(f"Testing {test_ticker}...")
+            test_metrics = get_enhanced_metrics(test_ticker)
+            st.json(test_metrics)
+        
+        if st.button("🗑️ Clear Cache", use_container_width=True):
+            clear_cache()
+            st.success("Cache cleared!")
+        
+        st.divider()
+        
         num_recs = st.slider(
             "Number of Recommendations",
             min_value=1,
@@ -1196,9 +1289,10 @@ def main():
                 st.subheader("Financial Data")
                 try:
                     import yfinance
-                    st.success("✅ yfinance ready (no key needed!)")
+                    st.success("✅ yfinance ready")
                 except ImportError:
                     st.error("❌ yfinance not installed")
+                    st.code("pip install yfinance", language="bash")
             
             st.divider()
             
