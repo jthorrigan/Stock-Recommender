@@ -23,8 +23,6 @@ try:
     YFINANCE_AVAILABLE = True
 except ImportError:
     YFINANCE_AVAILABLE = False
-    logger = logging.getLogger(__name__)
-    logger.warning("yfinance not installed. Install with: pip install yfinance")
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -883,7 +881,7 @@ def generate_recommendations(
     return recommendations
 
 # ============================================================================
-# STREAMLIT UI - SIMPLIFIED
+# STREAMLIT UI
 # ============================================================================
 
 def render_recommendation_card(rec: Dict):
@@ -1105,7 +1103,7 @@ def main():
                 st.success(f"✅ Crawled {len(articles)} articles")
         
         if st.button("📊 Generate Recommendations", use_container_width=True):
-            if not st.session_state.crawled_articles:
+            if not hasattr(st.session_state, 'crawled_articles') or not st.session_state.crawled_articles:
                 st.warning("Please run crawler first")
             else:
                 with st.spinner("Analyzing articles..."):
@@ -1119,8 +1117,11 @@ def main():
         test_ticker = st.text_input("Test ticker (e.g., AAPL):", value="AAPL")
         if st.button("📍 Test Single Ticker", use_container_width=True):
             st.info(f"Testing {test_ticker}...")
-            test_metrics = get_enhanced_metrics(test_ticker)
-            st.json(test_metrics)
+            try:
+                test_metrics = get_enhanced_metrics(test_ticker)
+                st.json(test_metrics)
+            except Exception as e:
+                st.error(f"Error: {str(e)}")
         
         if st.button("🗑️ Clear Cache", use_container_width=True):
             clear_cache()
@@ -1147,11 +1148,15 @@ def main():
             if FRED_API_KEY:
                 st.success("✅ FRED (optional macro data)")
     
-    if st.session_state.last_crawl:
+    # Fixed: Use hasattr instead of checking truthiness directly
+    has_crawl_data = hasattr(st.session_state, 'last_crawl') and st.session_state.last_crawl is not None
+    
+    if has_crawl_data:
         tab1, tab2, tab3 = st.tabs(["📋 Recommendations", "📰 Crawl Data", "📊 Analytics"])
         
         with tab1:
-            if st.session_state.recommendations:
+            has_recommendations = hasattr(st.session_state, 'recommendations') and st.session_state.recommendations
+            if has_recommendations:
                 st.subheader(f"Top {len(st.session_state.recommendations)} Recommendations")
                 for i, rec in enumerate(st.session_state.recommendations[:num_recs], 1):
                     st.markdown(f"### #{i} - {rec['company_name']} ({rec['ticker']})")
@@ -1161,19 +1166,28 @@ def main():
         
         with tab2:
             st.subheader("Web Crawl Status")
-            render_crawl_status(st.session_state.crawled_articles)
-            
-            st.subheader("Recent Articles")
-            articles_df = pd.DataFrame(st.session_state.crawled_articles)
-            if not articles_df.empty:
-                st.dataframe(
-                    articles_df[['source', 'title', 'published']].head(20),
-                    use_container_width=True,
-                    hide_index=True
-                )
+            if hasattr(st.session_state, 'crawled_articles') and st.session_state.crawled_articles:
+                render_crawl_status(st.session_state.crawled_articles)
+                
+                st.subheader("Recent Articles")
+                articles_df = pd.DataFrame(st.session_state.crawled_articles)
+                if not articles_df.empty:
+                    st.dataframe(
+                        articles_df[['source', 'title', 'published']].head(20),
+                        use_container_width=True,
+                        hide_index=True
+                    )
+            else:
+                st.info("No crawl data available")
         
         with tab3:
-            render_analytics_dashboard(st.session_state.crawled_articles, st.session_state.recommendations)
+            if hasattr(st.session_state, 'crawled_articles') and st.session_state.crawled_articles:
+                render_analytics_dashboard(
+                    st.session_state.crawled_articles,
+                    st.session_state.recommendations if hasattr(st.session_state, 'recommendations') else []
+                )
+            else:
+                st.info("Run the crawler first to see analytics")
     else:
         col1, col2 = st.columns(2)
         with col1:
