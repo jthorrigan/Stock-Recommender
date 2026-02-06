@@ -243,13 +243,16 @@ def get_enhanced_metrics(ticker: str) -> Dict:
                 ticker_obj = yf.Ticker(ticker)
                 info = ticker_obj.info
                 
-                if info:
-                    # Price
+                if info and len(info) > 0:
+                    logger.info(f"yfinance returned {len(info)} fields for {ticker}")
+                    
+                    # Price - try multiple field names
                     if 'currentPrice' in info:
                         metrics['price'] = round(float(info.get('currentPrice')), 2)
-                        logger.info(f"{ticker} price: ${metrics['price']}")
+                        logger.info(f"{ticker} price (currentPrice): ${metrics['price']}")
                     elif 'regularMarketPrice' in info:
                         metrics['price'] = round(float(info.get('regularMarketPrice')), 2)
+                        logger.info(f"{ticker} price (regularMarketPrice): ${metrics['price']}")
                     
                     # P/E Ratio
                     if 'trailingPE' in info:
@@ -258,8 +261,8 @@ def get_enhanced_metrics(ticker: str) -> Dict:
                             if pe and pe > 0:
                                 metrics['pe_ratio'] = round(float(pe), 2)
                                 logger.info(f"{ticker} P/E: {metrics['pe_ratio']}")
-                        except:
-                            pass
+                        except Exception as pe_err:
+                            logger.debug(f"P/E extraction failed: {pe_err}")
                     
                     # 52-week high/low
                     if 'fiftyTwoWeekHigh' in info:
@@ -283,8 +286,8 @@ def get_enhanced_metrics(ticker: str) -> Dict:
                                     metrics['market_cap'] = f"${market_cap/1e9:.1f}B"
                                 elif market_cap >= 1e6:
                                     metrics['market_cap'] = f"${market_cap/1e6:.1f}M"
-                        except:
-                            pass
+                        except Exception as mc_err:
+                            logger.debug(f"Market cap extraction failed: {mc_err}")
                     
                     # Dividend yield
                     if 'trailingAnnualDividendYield' in info:
@@ -310,9 +313,11 @@ def get_enhanced_metrics(ticker: str) -> Dict:
                         return metrics
                     else:
                         logger.info(f"⚠️ yfinance has price, trying Finnhub for more data")
+                else:
+                    logger.warning(f"yfinance returned empty or no info for {ticker}")
             
             except Exception as yf_err:
-                logger.debug(f"yfinance failed: {yf_err}")
+                logger.error(f"yfinance error: {str(yf_err)}", exc_info=True)
         
         # SECONDARY: Finnhub (FREE - 60 calls/min)
         if FINNHUB_API_KEY and metrics['price'] != 'N/A':
@@ -393,7 +398,7 @@ def get_enhanced_metrics(ticker: str) -> Dict:
         return metrics
     
     except Exception as e:
-        logger.error(f"Unexpected error for {ticker}: {str(e)}")
+        logger.error(f"Unexpected error for {ticker}: {str(e)}", exc_info=True)
         metrics['data_source'] = f'Error: {str(e)}'
         return metrics
 
@@ -1057,28 +1062,6 @@ def render_analytics_dashboard(articles: List[Dict], recommendations: List[Dict]
             cape_info = get_cape_ratio_approximation()
             if cape_info['cape_ratio'] != 'N/A':
                 st.info(f"📊 **S&P 500 CAPE Ratio (Shiller P/E):** {cape_info['cape_ratio']} (as of {cape_info['cape_date']})")
-            
-            st.markdown("""
-            **⭐ Why yfinance is BETTER than Marketstack:**
-            
-            ✅ **yfinance**
-            - ✅ No API key required
-            - ✅ Includes market cap reliably
-            - ✅ Includes P/E ratio, dividend yield, EPS
-            - ✅ Unlimited requests
-            - ✅ Company sector & industry data
-            - 💰 Cost: $0/month
-            
-            ❌ **Marketstack free tier**
-            - ❌ Only 100 requests/month
-            - ❌ MISSING market cap
-            - ❌ MISSING P/E ratio
-            - ❌ MISSING dividend yield
-            - ❌ OHLCV data only (price, open, high, low, volume)
-            - 💰 Cost: $0 free, but $99+/month for useful data
-            
-            **Recommendation:** Use yfinance exclusively - no other API needed!
-            """)
 
 def main():
     """Main Streamlit application"""
@@ -1119,9 +1102,22 @@ def main():
             st.info(f"Testing {test_ticker}...")
             try:
                 test_metrics = get_enhanced_metrics(test_ticker)
+                st.write("**Metrics Retrieved:**")
                 st.json(test_metrics)
+                
+                # Also show debug info
+                with st.expander("🔍 Debug Info"):
+                    if YFINANCE_AVAILABLE:
+                        ticker_obj = yf.Ticker(test_ticker)
+                        info = ticker_obj.info
+                        st.write(f"Total fields returned by yfinance: {len(info)}")
+                        st.write("Available fields:")
+                        st.json({k: v for k, v in list(info.items())[:20]})
+                    else:
+                        st.error("yfinance not available")
             except Exception as e:
                 st.error(f"Error: {str(e)}")
+                logger.error(f"Test ticker error: {str(e)}", exc_info=True)
         
         if st.button("🗑️ Clear Cache", use_container_width=True):
             clear_cache()
@@ -1138,15 +1134,6 @@ def main():
             - News crawling from 7 financial sources
             - AI-generated investment theses
             """)
-        
-        with st.expander("🔑 API Configuration"):
-            st.success("✅ yfinance (primary - no key needed)")
-            if FINNHUB_API_KEY:
-                st.success("✅ Finnhub (optional fallback)")
-            if HF_API_KEY:
-                st.success("✅ Hugging Face (optional AI)")
-            if FRED_API_KEY:
-                st.success("✅ FRED (optional macro data)")
     
     # Fixed: Use hasattr instead of checking truthiness directly
     has_crawl_data = hasattr(st.session_state, 'last_crawl') and st.session_state.last_crawl is not None
