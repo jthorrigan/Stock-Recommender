@@ -119,7 +119,9 @@ def get_company_info(ticker: str) -> Dict:
                     'dividend_yield': data.get('DividendYield', 'N/A'),
                     'market_cap': market_cap,
                     'market_cap_numeric': market_cap_num,
-                    'category': TICKER_CATEGORIES.get(ticker, 'Unknown')
+                    'category': TICKER_CATEGORIES.get(ticker, 'Unknown'),
+                    'profit_margin': data.get('ProfitMargin', 'N/A'),
+                    'eps': data.get('EPS', 'N/A')
                 }
         
         # Fallback
@@ -130,7 +132,10 @@ def get_company_info(ticker: str) -> Dict:
             'industry': 'Unknown',
             'market_cap': 'Unknown',
             'market_cap_numeric': 0,
-            'category': TICKER_CATEGORIES.get(ticker, 'Unknown')
+            'category': TICKER_CATEGORIES.get(ticker, 'Unknown'),
+            'pe_ratio': 'N/A',
+            'profit_margin': 'N/A',
+            'eps': 'N/A'
         }
     
     except Exception as e:
@@ -142,7 +147,106 @@ def get_company_info(ticker: str) -> Dict:
             'industry': 'Unknown',
             'market_cap': 'Unknown',
             'market_cap_numeric': 0,
-            'category': TICKER_CATEGORIES.get(ticker, 'Unknown')
+            'category': TICKER_CATEGORIES.get(ticker, 'Unknown'),
+            'pe_ratio': 'N/A',
+            'profit_margin': 'N/A',
+            'eps': 'N/A'
+        }
+
+@st.cache_data(ttl=3600)
+def get_stock_metrics(ticker: str) -> Dict:
+    """
+    Fetch stock metrics including volatility and technical indicators
+    
+    Args:
+        ticker: Stock ticker symbol
+    
+    Returns:
+        Dictionary with stock metrics
+    """
+    try:
+        metrics = {
+            'ticker': ticker,
+            'pe_ratio': 'N/A',
+            'cape_ratio': 'N/A',
+            'volatility': 'N/A',
+            'beta': 'N/A',
+            '52_week_high': 'N/A',
+            '52_week_low': 'N/A',
+            'avg_volume': 'N/A'
+        }
+        
+        if ALPHA_VANTAGE_API_KEY == "demo":
+            return metrics
+        
+        # Fetch daily data for volatility calculation
+        params = {
+            'function': 'TIME_SERIES_DAILY',
+            'symbol': ticker,
+            'outputsize': 'compact',
+            'apikey': ALPHA_VANTAGE_API_KEY
+        }
+        
+        response = requests.get('https://www.alphavantage.co/query', params=params, timeout=10)
+        response.raise_for_status()
+        data = response.json()
+        
+        if 'Time Series (Daily)' in data:
+            time_series = data['Time Series (Daily)']
+            
+            # Get last 90 days of data for volatility
+            prices = []
+            for date, daily_data in sorted(time_series.items())[-90:]:
+                try:
+                    close = float(daily_data['4. close'])
+                    prices.append(close)
+                except:
+                    pass
+            
+            if len(prices) > 1:
+                # Calculate volatility (standard deviation of returns)
+                returns = [(prices[i] - prices[i-1]) / prices[i-1] for i in range(1, len(prices))]
+                volatility = (sum((r - sum(returns) / len(returns)) ** 2 for r in returns) / len(returns)) ** 0.5
+                metrics['volatility'] = round(volatility * 100, 2)  # Convert to percentage
+                
+                # 52-week high/low
+                metrics['52_week_high'] = round(max(prices), 2)
+                metrics['52_week_low'] = round(min(prices), 2)
+                
+                # Average volume (approximated)
+                metrics['avg_volume'] = len(prices)
+        
+        # Fetch overview data for PE ratio
+        overview_params = {
+            'function': 'OVERVIEW',
+            'symbol': ticker,
+            'apikey': ALPHA_VANTAGE_API_KEY
+        }
+        
+        overview_response = requests.get('https://www.alphavantage.co/query', params=overview_params, timeout=10)
+        overview_response.raise_for_status()
+        overview_data = overview_response.json()
+        
+        if 'PERatio' in overview_data and overview_data['PERatio'] != 'None':
+            metrics['pe_ratio'] = round(float(overview_data.get('PERatio', 0)), 2)
+        
+        # Note: CAPE ratio requires historical earnings data which is complex to calculate
+        # For now, we'll note it as N/A or calculate a simplified version
+        metrics['cape_ratio'] = 'Market Data Required'
+        
+        return metrics
+    
+    except Exception as e:
+        logger.warning(f"Error fetching metrics for {ticker}: {str(e)}")
+        return {
+            'ticker': ticker,
+            'pe_ratio': 'N/A',
+            'cape_ratio': 'N/A',
+            'volatility': 'N/A',
+            'beta': 'N/A',
+            '52_week_high': 'N/A',
+            '52_week_low': 'N/A',
+            'avg_volume': 'N/A'
         }
 
 # ============================================================================
@@ -777,7 +881,7 @@ def render_analytics_dashboard(articles: List[Dict], recommendations: List[Dict]
                 use_container_width=True,
                 height=300
             )
-            st.markdown("*Chart shows article mentions by company category*")
+            st.markdown("*Chart shows article mentions by company category (Y-axis: Mention Count, X-axis: Category)*")
         
         with col2:
             st.markdown("**Top 10 Mentioned Tickers**")
@@ -788,7 +892,7 @@ def render_analytics_dashboard(articles: List[Dict], recommendations: List[Dict]
                 use_container_width=True,
                 height=300
             )
-            st.markdown("*Chart shows most frequently mentioned stocks in news*")
+            st.markdown("*Chart shows most frequently mentioned stocks in news (Y-axis: Mention Count, X-axis: Ticker)*")
         
         st.markdown("---")
         
@@ -811,6 +915,62 @@ def render_analytics_dashboard(articles: List[Dict], recommendations: List[Dict]
     
     else:
         st.info("Run the web crawler to see analytics data")
+    
+    st.markdown("---")
+    
+    # Company Metrics Section
+    st.markdown("### 💹 Company Financial Metrics")
+    st.markdown("*Most recent P/E ratio, CAPE ratio approximation, and volatility data*")
+    
+    if articles:
+        mentions = extract_stock_mentions(articles)
+        
+        # Fetch metrics for mentioned tickers
+        metrics_data = []
+        with st.spinner("Fetching financial metrics..."):
+            for ticker in sorted(mentions.keys()):
+                metrics = get_stock_metrics(ticker)
+                company_info = get_company_info(ticker)
+                
+                metrics_data.append({
+                    'Ticker': ticker,
+                    'Company': company_info.get('name', ticker)[:20],  # Truncate long names
+                    'Category': TICKER_CATEGORIES.get(ticker, 'N/A'),
+                    'P/E Ratio': metrics.get('pe_ratio', 'N/A'),
+                    'CAPE Ratio': metrics.get('cape_ratio', 'N/A'),
+                    'Volatility (%)': metrics.get('volatility', 'N/A'),
+                    '52W High': metrics.get('52_week_high', 'N/A'),
+                    '52W Low': metrics.get('52_week_low', 'N/A')
+                })
+        
+        if metrics_data:
+            metrics_df = pd.DataFrame(metrics_data)
+            
+            st.dataframe(
+                metrics_df,
+                use_container_width=True,
+                hide_index=True,
+                column_config={
+                    'Ticker': st.column_config.TextColumn('Symbol', width='small'),
+                    'Company': st.column_config.TextColumn('Company Name'),
+                    'Category': st.column_config.TextColumn('Market Cap', width='small'),
+                    'P/E Ratio': st.column_config.NumberColumn('P/E Ratio', format='%.2f'),
+                    'CAPE Ratio': st.column_config.TextColumn('CAPE Ratio', width='small'),
+                    'Volatility (%)': st.column_config.NumberColumn('Volatility (%)', format='%.2f'),
+                    '52W High': st.column_config.NumberColumn('52-Week High', format='%.2f'),
+                    '52W Low': st.column_config.NumberColumn('52-Week Low', format='%.2f')
+                }
+            )
+            
+            st.markdown("""
+            **Metric Definitions:**
+            - **P/E Ratio**: Price-to-Earnings ratio (lower typically = better value)
+            - **CAPE Ratio**: Cyclically Adjusted P/E (requires 10-year earnings history)
+            - **Volatility (%)**: 90-day annualized return volatility (higher = more risk)
+            - **52W High/Low**: 52-week trading range
+            """)
+        else:
+            st.info("Financial metrics data not available. Ensure Alpha Vantage API key is configured.")
     
     st.markdown("---")
     
@@ -907,14 +1067,25 @@ def main():
                 st.success("✅ Hugging Face API configured - Full AI explanations enabled")
             else:
                 st.warning("⚠️ Using template explanations (no API key needed)")
-                st.markdown("""
-                **Optional:** To enable AI-powered explanations:
-                1. Get free API key from [Hugging Face](https://huggingface.co/settings/tokens)
-                2. Add to `.env` file: `HF_API_KEY=hf_...`
-                3. Restart the app
-                
-                The app works great with or without an API key!
-                """)
+            
+            st.info("Financial Data Status:")
+            if ALPHA_VANTAGE_API_KEY != "demo":
+                st.success("✅ Alpha Vantage API configured - Full metrics enabled")
+            else:
+                st.warning("⚠️ Using demo mode - Limited financial data")
+            
+            st.markdown("""
+            **Optional APIs:**
+            1. **Hugging Face** (for AI explanations):
+               - Get free key: https://huggingface.co/settings/tokens
+               - Add to `.env`: `HF_API_KEY=hf_...`
+            
+            2. **Alpha Vantage** (for financial metrics):
+               - Get free key: https://www.alphavantage.co/api/
+               - Add to `.env`: `ALPHA_VANTAGE_API_KEY=...`
+            
+            The app works great with or without API keys!
+            """)
     
     # Main content
     if st.session_state.last_crawl:
